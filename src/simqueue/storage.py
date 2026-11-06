@@ -215,6 +215,36 @@ class ImageBackend(AppleBackend):
         self.device_root.mkdir(mode=0o700, exist_ok=True)
         return super().run(*args, timeout=timeout)
 
+    def create(self, name, device_type, runtime):
+        uuid = super().create(name, device_type, runtime)
+        # Only a device just created by this call may have its sample Contacts seed
+        # moved. Never apply to existing devices, at boot, or on runtime upgrades.
+        if runtime in {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+            "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+        }:
+            device = self.device_root / uuid
+            seed = device / "data/Library/AddressBook"
+            if device.is_symlink() or seed.is_symlink() or not seed.is_dir():
+                raise Attention("Fresh Contacts seed is unverifiable; preserve device")
+            if not seed.resolve().is_relative_to(device.resolve()):
+                raise Attention("Fresh Contacts seed escapes the new device; preserve device")
+            saved = device / ".simqueue-original-contacts"
+            if saved.exists() or saved.is_symlink():
+                raise Attention("Fresh Contacts backup already exists; preserve device")
+            seed.rename(saved)
+            atomic_json(
+                device / ".simqueue-initialization.json",
+                {
+                    "version": 1,
+                    "runtime": runtime,
+                    "contacts": "empty-on-first-boot",
+                    "reason": "Bundled sample Contacts triggers CNContactPosterMigrator null-array crash",
+                    "preserved_seed": saved.name,
+                },
+            )
+        return uuid
+
     def data_exists(self, uuid):
         self.store.ensure()
         return super().data_exists(uuid)

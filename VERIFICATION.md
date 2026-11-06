@@ -48,3 +48,36 @@ Machine-specific reports and configuration backups are retained on T9 under
 - Evidence: `~/Developer/Artifacts/simqueue-image-acceptance-20261105-v2/result.json`
   and `~/Developer/Artifacts/simqueue-captures/3e666cc52ff444eebf45de649c0b9dc8/`.
   Configuration backups remain on T9, outside Git.
+
+## Contacts startup workaround — 0.2.1, 5–6 November 2026
+
+- Reproduced the reported `com.apple.migrationpluginwrapper` crash on a fresh
+  iOS 27 device as well as the earlier iOS 26.5 baseline. Simulator coalition UUID
+  identifies the device; the fault is `CNContactPosterMigrator performMigration`
+  passing a null array into `CFArrayGetCount` during AddressBookLegacy migration.
+- Moving only a freshly created device's bundled Contacts seed aside prevented
+  the crash. iOS regenerated a fresh Contacts database. The automated workaround
+  preserves the seed inside that disposable device, affects only iOS 26.5/27.0
+  identifiers, and never changes existing simulators or shared runtimes.
+- iOS 26.5 full installed-MCP acceptance passed: normal empty Contacts screen,
+  Puzzle Quest launch/menu screenshot, no device-specific migration crash reports,
+  shared-holder protection, verified deletion and image eject.
+- iOS 27 boot and Contacts launch/screenshot also passed with no migration crash
+  report. Its additional Puzzle Quest install timed out after 120 seconds, followed
+  by a CoreSimulator inventory timeout. This app check did not pass. A bounded
+  service sample was retained; after verifying the only booted simulator belonged
+  to this test, a graceful CoreSimulator service restart restored responsiveness.
+- Both abandoned test client PIDs were verified gone with no registered children;
+  their exact owned requests were released through coordinator recovery. Normal
+  simqueue cleanup verified deletion of the iOS 27 test UUID and data directory.
+  The known failed install's staging copy was removed and the image cleanly ejected.
+- No migration helper crashes were recorded for the empty-Contacts probe or either
+  fixed-runtime test, including a scan after shutdown. Crash reporting stays enabled.
+- 35 automated tests passed, including both affected runtime identifiers, preservation
+  of existing contact data, refusal of a symlinked seed, and unchanged initialization
+  for other runtimes. Ruff and formatting checks passed.
+- The acceptance runner now retains private cleanup capabilities until verified
+  deletion and always writes a failure/cleanup report even if native inventory hangs.
+- T9 evidence directories: `simqueue-migration-ios27-20261105`,
+  `simqueue-migration-fresh-contacts-20261105`, `simqueue-contacts-fix-ios26-20261105`,
+  `simqueue-contacts-fix-ios27-20261105`; screenshots under `simqueue-captures/`.

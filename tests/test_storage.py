@@ -188,3 +188,68 @@ def test_interrupted_setup_cannot_fall_back_internally(tmp_path):
     (tmp_path / "storage-setup-intent.json").write_text("{}")
     with pytest.raises(Attention, match="setup is incomplete"):
         backend_for(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+        "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+    ],
+)
+def test_only_new_devices_receive_fresh_contacts_workaround(store, monkeypatch, runtime):
+    from simqueue.backend import AppleBackend
+
+    s, _, _, _ = store
+    backend = ImageBackend(s)
+    existing = backend.device_root / "regular" / "data/Library/AddressBook"
+    existing.mkdir(parents=True)
+    (existing / "user-data").write_text("preserve")
+
+    def create(self, name, device_type, runtime):
+        seed = self.device_root / "new-device" / "data/Library/AddressBook"
+        seed.mkdir(parents=True)
+        (seed / "sample-db").write_text("sample")
+        return "new-device"
+
+    monkeypatch.setattr(AppleBackend, "create", create)
+    uid = backend.create("agent-simqueue-new", "phone", runtime)
+    new = backend.device_root / uid
+    assert not (new / "data/Library/AddressBook").exists()
+    assert (new / ".simqueue-original-contacts/sample-db").read_text() == "sample"
+    assert (
+        json.loads((new / ".simqueue-initialization.json").read_text())["contacts"]
+        == "empty-on-first-boot"
+    )
+    assert (existing / "user-data").read_text() == "preserve"
+
+
+def test_other_runtimes_keep_their_standard_contacts_seed(store, monkeypatch):
+    from simqueue.backend import AppleBackend
+
+    s, _, _, _ = store
+    backend = ImageBackend(s)
+    seed = backend.device_root / "new-device" / "data/Library/AddressBook"
+    seed.mkdir(parents=True)
+    (seed / "sample").write_text("standard")
+    monkeypatch.setattr(AppleBackend, "create", lambda *args: "new-device")
+    backend.create("agent-simqueue-new", "phone", "com.apple.CoreSimulator.SimRuntime.iOS-28-0")
+    assert (seed / "sample").read_text() == "standard"
+    assert not (backend.device_root / "new-device/.simqueue-initialization.json").exists()
+
+
+def test_fresh_contacts_symlink_is_preserved_and_refused(store, monkeypatch):
+    from simqueue.backend import AppleBackend
+
+    s, _, _, _ = store
+    backend = ImageBackend(s)
+    outside = s.t9 / "regular-contacts"
+    outside.mkdir()
+    (outside / "user-data").write_text("preserve")
+    seed = backend.device_root / "new-device/data/Library/AddressBook"
+    seed.parent.mkdir(parents=True)
+    seed.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(AppleBackend, "create", lambda *args: "new-device")
+    with pytest.raises(Attention, match="unverifiable"):
+        backend.create("agent-simqueue-new", "phone", "com.apple.CoreSimulator.SimRuntime.iOS-26-5")
+    assert seed.is_symlink() and (outside / "user-data").read_text() == "preserve"

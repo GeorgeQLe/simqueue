@@ -113,6 +113,31 @@ app installation/launch, screenshot export, final deletion and normal image ejec
 It uses an existing Puzzle Quest simulator build and verifies regular devices are
 unchanged. The older `acceptance.py` uses an isolated internal test queue.
 
+## Contacts migration startup workaround (0.2.1)
+
+On this host, fresh iOS 26.5 (23F77) and iOS 27.0 (24A5390f) devices with Apple's
+bundled sample Contacts data crash in `CNContactPosterMigrator performMigration`
+(`CFArrayGetCount` receives a null array). The macOS crash dialog may appear or
+remain visible later, including after the simulator has shut down.
+
+For those two runtime identifiers, the image backend moves the sample AddressBook
+seed aside immediately after creating a new disposable device, before its first
+boot. iOS then initializes an empty Contacts database normally. The original seed
+is preserved inside that same disposable device until normal final-release cleanup.
+No migration service is disabled, crash reporting remains enabled, and no shared
+runtime or existing simulator is modified. Contacts tests must supply their own
+fixtures rather than depend on Apple's bundled sample contacts. Other runtimes
+retain their normal initialization behavior.
+
+The installed-launcher app acceptance now checks Contacts launch and screenshot,
+Puzzle Quest launch and screenshot, absence of device-specific migration crash
+reports, shared-holder protection and verified cleanup. The crash-report reader
+matches the simulator coalition UUID, so another task's crash cannot fail the test.
+The acceptance runner keeps private, mode-0600 cleanup capabilities in its T9 run
+directory until verified cleanup succeeds. If cleanup fails, preserve that file,
+recover with the original capabilities, and remove it only after verified deletion.
+Never copy those credentials into reports or Git.
+
 ## Install on this Mac
 
 Python 3.11+ and the official MCP Python SDK v2 are required. `uv.lock` pins the full
