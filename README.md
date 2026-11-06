@@ -6,6 +6,46 @@ isolated device; collaborators can explicitly join a shared device using a priva
 capability. The last release shuts down and deletes the device and verifies its UUID
 and device directory are gone.
 
+## Why simqueue exists
+
+Several coding agents can request simulators at once. Uncoordinated tests leave
+large device directories behind, compete for resources, or delete a device another
+agent still needs. Simqueue provides one host-local queue shared by separate MCP
+server processes, private per-agent leases, explicit collaboration, and verified
+cleanup after the final holder finishes. It uses stdio MCP; it opens no network port.
+
+The core queue works with the normal internal CoreSimulator device set. An optional
+APFS disk-image connection keeps disposable device data on external storage while
+leaving regular working simulators and shared runtime installations alone.
+
+**Status:** experimental macOS developer tooling, version 0.2.1. This repository
+contains the source and tests; local simulator data, disk images, screenshots,
+ownership journals and recovery credentials are not included.
+
+## Open issue: iOS 27 app installation
+
+**iOS 27 app execution from the external image is not fully verified.** On the tested
+iOS 27.0 runtime (24A5390f), boot and Contacts launch/screenshot succeeded after the
+Contacts workaround below. Installing an existing simulator app then exceeded the
+120-second native `simctl install` timeout. Subsequent CoreSimulator inventory calls
+also stopped responding. A graceful service restart restored responsiveness, and
+the disposable device was shut down, deleted and its image ejected.
+
+The installation stall's root cause remains open. It has not been established that
+the runtime, the external image, or simqueue causes it. The Contacts startup crash
+and the app-installation timeout are distinct observations; fixing the former does
+not establish that the latter is fixed. No automatic service restart is performed.
+
+| Tested runtime | External-image result |
+| --- | --- |
+| iOS 26.5 (23F77) | Boot, Contacts, app install/launch, screenshots, shared leases and final cleanup passed. |
+| iOS 27.0 (24A5390f) | Boot and Contacts passed; app installation timed out. Full app execution remains unverified. |
+
+Until this is resolved, use the verified iOS 26.5 path for app tests on this host.
+The next investigation should compare the same app on fresh internal and external
+iOS 27 device sets and retain install/service diagnostics. These are host-specific
+observations, not a claim that every iOS 27 simulator installation fails.
+
 ## Agent workflow
 
 1. `inventory`: choose exact installed device-type and runtime identifiers.
@@ -63,8 +103,7 @@ The small live journal defaults to `~/Library/Application Support/simqueue`. Sou
 virtual environment, dependency caches, scratch and retained test evidence belong on
 T9. With the image connection configured, disposable device data lives in an APFS
 sparsebundle on T9 and is removed at the end of the task. Disconnecting T9 prevents
-the tool from running;
-reconnect it and sweep to complete interrupted cleanup. Regular working simulators
+the tool from running; reconnect it and sweep to complete interrupted cleanup. Regular working simulators
 and shared runtime installations remain internal.
 
 ## T9 image connection (0.2)
@@ -83,8 +122,8 @@ simqueue storage-detach           # Only when all managed work is finished
 ```
 
 On this Mac the backing image is `~/Developer/SimulatorStorage/simqueue.sparsebundle`,
-with a 64 GB maximum virtual size; physical allocation grows as files are written. Deleted device space is reusable
-inside the image; backing bands do not necessarily shrink immediately.
+with a 64 GB maximum virtual size; physical allocation grows as files are written.
+Deleted device space is reusable inside the image; backing bands do not necessarily shrink immediately.
 It mounts at `~/Library/Application Support/simqueue/DeviceVolume`. Every simulator
 command verifies T9 and image volume identities. Missing or changed storage fails
 closed; it never silently writes device data onto the internal mount directory.
@@ -138,10 +177,36 @@ directory until verified cleanup succeeds. If cleanup fails, preserve that file,
 recover with the original capabilities, and remove it only after verified deletion.
 Never copy those credentials into reports or Git.
 
-## Install on this Mac
+## Installation and host-specific requirements
 
-Python 3.11+ and the official MCP Python SDK v2 are required. `uv.lock` pins the full
-resolved environment. Verify T9 with `developer-host storage` before installing.
+Requirements: macOS with Xcode and its command-line tools, an installed simulator
+runtime, Python 3.11+, and `uv`. The official MCP Python SDK v2 and development tools
+are pinned in `uv.lock`.
+
+The current Apple backend invokes `~/.local/bin/apple-tools xcrun simctl ...`.
+That host-provided wrapper selects the intended Xcode and isolates Apple's tool
+PATH; **it is not bundled here**. Supply that wrapper on another host before native
+simulator operations. The queue tests use a fake backend and need no running
+simulator.
+
+The optional external-image integration is currently specific to the original host:
+it expects external storage mounted at `~/Developer` and a `~/.local/bin/developer-host`
+helper returning verified JSON storage readiness. That helper is also not bundled.
+The image backing path and mount point are provisioned by `storage-init`; this is
+not a general external-drive configuration wizard. Review `src/simqueue/storage.py`
+and adapt host integration before provisioning elsewhere. Without image configuration,
+the backend uses the normal internal device set.
+
+Clone the public repository, then install dependencies:
+
+```sh
+git clone https://github.com/GeorgeQLe/simqueue.git
+cd simqueue
+uv sync --locked
+uv run simqueue --help
+```
+
+On the original T9-configured host, verify `developer-host storage` and use:
 
 ```sh
 UV_CACHE_DIR="$HOME/Developer/PackageCaches/uv" uv sync --locked
@@ -154,20 +219,17 @@ LaunchAgent at `~/Library/LaunchAgents/com.georgele.simqueue.sweep.plist`.
 Load it using `launchctl bootstrap "gui/$(id -u)" <plist-path>`. New Codex sessions
 load the MCP entry; existing tasks do not need to be restarted.
 
-For headless Claude, the installed minimal config is `~/.config/simqueue/mcp.json`;
-pass `--mcp-config` with that path to `claude-review` when simulator access is needed.
-For interactive Claude, add a project-local stdio entry where testing is needed:
+For Claude Code, add a project-local stdio entry where testing is needed:
 
 ```sh
 claude mcp add --scope local simqueue -- "$HOME/.local/bin/simqueue" serve
 ```
 
-Headless `claude-review` uses strict MCP configuration. Pass an explicit minimal
-config containing simqueue only when the task will use it; keep read-only reviews
-without MCP servers. Example server object:
+For clients using an MCP JSON configuration, replace the absolute executable path
+below with your checkout's installed entry point. Example server object:
 
 ```json
-{"mcpServers":{"simqueue":{"command":"/Users/georgele/.local/bin/simqueue","args":["serve"]}}}
+{"mcpServers":{"simqueue":{"command":"/absolute/path/to/simqueue/.venv/bin/simqueue","args":["serve"]}}}
 ```
 
 Do not change capacity while leases exist. Every process (including the sweeper) must
@@ -205,7 +267,7 @@ Official dependencies/protocol: [MCP Python SDK](https://github.com/modelcontext
 ## Disable / uninstall
 
 Release and verify all leases first. Run `codex mcp remove simqueue` and
-`launchctl bootout gui/501/com.georgele.simqueue.sweep`, then remove only the managed
+`launchctl bootout "gui/$(id -u)/com.georgele.simqueue.sweep"`, then remove only the managed
 launcher and LaunchAgent definition. Preserve the live journal until every owned
 device is verified deleted. Configuration backups and local acceptance evidence are
 retained separately on T9; they are never committed to this repository.

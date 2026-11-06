@@ -5,3 +5,12 @@ __pycache__/
 *.egg-info/
 dist/
 .DS_Store
+
+# Local ownership and recovery material must never be published.
+private-capabilities.json
+state.json
+storage.json
+storage-setup-intent.json
+*.sparsebundle/
+.env
+.env.*
