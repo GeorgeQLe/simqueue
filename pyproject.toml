@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "simqueue"
+version = "0.1.0"
+description = "Local macOS simulator leases, fair queuing and owned-device cleanup for agents"
+requires-python = ">=3.11"
+dependencies = ["mcp>=2,<3"]
+
+[project.scripts]
+simqueue = "simqueue.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[tool.ruff]
+line-length = 100
