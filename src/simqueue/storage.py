@@ -1,4 +1,4 @@
-"""APFS image connection point. Backing bytes remain on a verified T9 volume.
+"""APFS image connection point. Backing bytes remain on a verified external volume.
 
 No privacy changes, privileged helper, physical-disk formatting or force ejects.
 """
@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from .backend import AppleBackend, Attention
+from .png import validate_png
 
 
 def command(args, *, plist=False, timeout=60):
@@ -27,6 +28,37 @@ def command(args, *, plist=False, timeout=60):
         return plistlib.loads(result.stdout) if plist else result.stdout
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise Attention("Storage command unavailable or result unverifiable") from exc
+
+
+def verify_external(root):
+    """Require a physical external, writable APFS mount; never trust its label."""
+    if root.is_symlink() or not os.path.ismount(root) or root.resolve() != root:
+        raise Attention("External storage is not mounted; internal fallback refused")
+    info = command(["/usr/sbin/diskutil", "info", "-plist", str(root)], plist=True)
+    if (
+        info.get("MountPoint") != str(root)
+        or info.get("Internal") is not False
+        or info.get("FilesystemType") != "apfs"
+        or info.get("WritableVolume") is not True
+        or not info.get("VolumeUUID")
+    ):
+        raise Attention("External writable APFS volume could not be verified")
+    return info
+
+
+def verify_readiness(root):
+    info = verify_external(root)
+    helper = Path.home() / ".local/bin/developer-host"
+    if helper.exists():
+        check = json.loads(
+            command([str(helper), "storage", "--format", "json", "--checker-protocol", "json"])
+        )
+        if (
+            check.get("status") != "ready"
+            or check.get("authority", {}).get("verdict") != "verified"
+        ):
+            raise Attention("Developer storage readiness could not be verified")
+    return info
 
 
 def atomic_json(path, data):
@@ -48,16 +80,23 @@ class ImageStore:
         self.root = Path(state_root).absolute()
         self.config = config
         try:
-            if config["version"] != 1:
+            if config["version"] not in (1, 2):
                 raise ValueError("Unsupported storage config")
             self.image = Path(config["image"])
             self.mount = Path(config["mount"])
-            self.t9 = Path(config["t9_root"])
-            if not all(p.is_absolute() for p in (self.image, self.mount, self.t9)):
+            self.external_root = Path(
+                config["external_root"] if config["version"] == 2 else config["t9_root"]
+            )
+            self.external_uuid = (
+                config["external_uuid"] if config["version"] == 2 else config["t9_uuid"]
+            )
+            if not all(p.is_absolute() for p in (self.image, self.mount, self.external_root)):
                 raise ValueError("Absolute paths required")
-            if not self.image.is_relative_to(self.t9) or self.mount.is_relative_to(self.t9):
-                raise ValueError("Image must be on T9; mount point must be internal")
-            if not config["t9_uuid"] or not config["volume_uuid"]:
+            if not self.image.is_relative_to(self.external_root) or self.mount.is_relative_to(
+                self.external_root
+            ):
+                raise ValueError("Image must be on external storage; mount point must be internal")
+            if not self.external_uuid or not config["volume_uuid"]:
                 raise ValueError("Storage identities missing")
         except (KeyError, TypeError, ValueError) as exc:
             raise Attention("Invalid storage configuration; internal fallback refused") from exc
@@ -92,15 +131,16 @@ class ImageStore:
             os.close(fd)
 
     def backing(self):
-        if not os.path.ismount(self.t9) or self.t9.is_symlink():
-            raise Attention("T9 is not mounted; internal fallback refused")
-        info = command(["/usr/sbin/diskutil", "info", "-plist", str(self.t9)], plist=True)
-        if info.get("VolumeUUID") != self.config["t9_uuid"]:
-            raise Attention("T9 volume identity changed; storage access refused")
+        info = verify_external(self.external_root)
+        if info.get("VolumeUUID") != self.external_uuid:
+            raise Attention("External storage volume identity changed; storage access refused")
         if self.image.is_symlink() or not self.image.is_dir():
-            raise Attention("Configured T9 sparsebundle is missing or replaced")
-        if self.image.resolve() != self.image or self.image.stat().st_dev != self.t9.stat().st_dev:
-            raise Attention("Image backing is outside the verified T9 filesystem")
+            raise Attention("Configured external storage sparsebundle is missing or replaced")
+        if (
+            self.image.resolve() != self.image
+            or self.image.stat().st_dev != self.external_root.stat().st_dev
+        ):
+            raise Attention("Image backing is outside the verified external storage filesystem")
 
     def attachment(self):
         images = command(["/usr/bin/hdiutil", "info", "-plist"], plist=True).get("images", [])
@@ -130,23 +170,7 @@ class ImageStore:
                     raise Attention("Unmounted destination is not empty; mounting refused")
                 if self.attachment() is not None:
                     raise Attention("Configured image attached elsewhere; preserve and inspect")
-                check = json.loads(
-                    command(
-                        [
-                            str(Path.home() / ".local/bin/developer-host"),
-                            "storage",
-                            "--format",
-                            "json",
-                            "--checker-protocol",
-                            "json",
-                        ]
-                    )
-                )
-                if (
-                    check.get("status") != "ready"
-                    or check.get("authority", {}).get("verdict") != "verified"
-                ):
-                    raise Attention("Developer storage readiness could not be verified")
+                verify_readiness(self.external_root)
                 command(
                     [
                         "/usr/sbin/diskutil",
@@ -195,7 +219,8 @@ class ImageStore:
 
     def status(self):
         return {
-            "mode": "t9-apfs-image",
+            "mode": "external-apfs-image",
+            "external_root": str(self.external_root),
             "image": str(self.image),
             "mount": str(self.mount),
             "device_set": str(self.mount / "Devices"),
@@ -205,6 +230,8 @@ class ImageStore:
 
 
 class ImageBackend(AppleBackend):
+    operation_timeout = 300
+
     def __init__(self, store):
         super().__init__()
         self.store = store
@@ -217,41 +244,69 @@ class ImageBackend(AppleBackend):
 
     def create(self, name, device_type, runtime):
         uuid = super().create(name, device_type, runtime)
-        # Only a device just created by this call may have its sample Contacts seed
-        # moved. Never apply to existing devices, at boot, or on runtime upgrades.
-        if runtime in {
+        try:
+            # Only a device just created by this call may have its sample Contacts seed
+            # moved. Never apply to existing devices, at boot, or on runtime upgrades.
+            if runtime in {
+                "com.apple.CoreSimulator.SimRuntime.iOS-26-3",
+                "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+                "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+            }:
+                device = self.device_root / uuid
+                seed = device / "data/Library/AddressBook"
+                if device.is_symlink() or seed.is_symlink() or not seed.is_dir():
+                    raise Attention("Fresh Contacts seed is unverifiable; preserve device")
+                if not seed.resolve().is_relative_to(device.resolve()):
+                    raise Attention("Fresh Contacts seed escapes the new device; preserve device")
+                saved = device / ".simqueue-original-contacts"
+                if saved.exists() or saved.is_symlink():
+                    raise Attention("Fresh Contacts backup already exists; preserve device")
+                seed.rename(saved)
+                atomic_json(
+                    device / ".simqueue-initialization.json",
+                    {
+                        "version": 1,
+                        "runtime": runtime,
+                        "contacts": "empty-on-first-boot",
+                        "reason": "Bundled sample Contacts triggers CNContactPosterMigrator null-array crash",
+                        "preserved_seed": saved.name,
+                    },
+                )
+        except OSError as exc:
+            raise Attention(
+                "Fresh-device initialization interrupted; preserve and reconcile"
+            ) from exc
+        return uuid
+
+    def validate_created(self, uuid, runtime):
+        if runtime not in {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-3",
             "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
             "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
         }:
-            device = self.device_root / uuid
-            seed = device / "data/Library/AddressBook"
-            if device.is_symlink() or seed.is_symlink() or not seed.is_dir():
-                raise Attention("Fresh Contacts seed is unverifiable; preserve device")
-            if not seed.resolve().is_relative_to(device.resolve()):
-                raise Attention("Fresh Contacts seed escapes the new device; preserve device")
-            saved = device / ".simqueue-original-contacts"
-            if saved.exists() or saved.is_symlink():
-                raise Attention("Fresh Contacts backup already exists; preserve device")
-            seed.rename(saved)
-            atomic_json(
-                device / ".simqueue-initialization.json",
-                {
-                    "version": 1,
-                    "runtime": runtime,
-                    "contacts": "empty-on-first-boot",
-                    "reason": "Bundled sample Contacts triggers CNContactPosterMigrator null-array crash",
-                    "preserved_seed": saved.name,
-                },
-            )
-        return uuid
+            return
+        device = self.device_root / uuid
+        marker = device / ".simqueue-initialization.json"
+        try:
+            seed = device / ".simqueue-original-contacts"
+            if device.is_symlink() or marker.is_symlink() or seed.is_symlink() or not seed.is_dir():
+                raise ValueError("Unverifiable initialization path")
+            proof = json.loads(marker.read_text())
+            if (
+                proof.get("version") != 1
+                or proof.get("runtime") != runtime
+                or proof.get("contacts") != "empty-on-first-boot"
+                or proof.get("preserved_seed") != ".simqueue-original-contacts"
+            ):
+                raise ValueError("Unverifiable initialization marker")
+        except (OSError, ValueError, AttributeError) as exc:
+            raise Attention(
+                "Fresh-device initialization is unverified; preserve and inspect"
+            ) from exc
 
     def data_exists(self, uuid):
         self.store.ensure()
         return super().data_exists(uuid)
-
-    def boot(self, uuid):
-        self.run("boot", uuid)
-        self.run("bootstatus", uuid, "-b", timeout=300)
 
     def install(self, uuid, app_path):
         source = Path(app_path).expanduser().resolve(strict=True)
@@ -289,30 +344,44 @@ class ImageBackend(AppleBackend):
         stage = Path(tempfile.mkdtemp(prefix="capture-", dir=stage_root))
         source = stage / filename
         self.run("io", uuid, "screenshot", str(source))
-        with source.open("rb") as data:
-            header = data.read(24)
-        if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
-            raise Attention("Screenshot producer returned an invalid PNG; preserved")
-        destination = self.store.t9 / "Artifacts/simqueue-captures" / request_id
+        try:
+            if source.is_symlink():
+                raise ValueError("Unverifiable screenshot path")
+            width, height = validate_png(source)
+        except (OSError, ValueError) as exc:
+            raise Attention("Screenshot producer returned an invalid PNG; preserved") from exc
+        destination = self.store.external_root / "Artifacts/simqueue-captures" / request_id
+        if destination.resolve() != destination:
+            raise Attention("Capture export path must not traverse symlinks")
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
         if (
-            not destination.resolve().is_relative_to(self.store.t9)
-            or destination.stat().st_dev != self.store.t9.stat().st_dev
+            not destination.resolve().is_relative_to(self.store.external_root)
+            or destination.stat().st_dev != self.store.external_root.stat().st_dev
         ):
-            raise Attention("Capture export must remain on verified T9 storage")
+            raise Attention("Capture export must remain on verified external storage")
         target = destination / filename
-        if target.exists():
+        if target.exists() or target.is_symlink():
             raise ValueError("Capture destination exists; choose another filename")
-        temporary = destination / (filename + ".partial")
-        shutil.copy2(source, temporary)
-        os.replace(temporary, target)
+        fd, temporary = tempfile.mkstemp(prefix=".capture-", suffix=".partial", dir=destination)
+        try:
+            with os.fdopen(fd, "wb") as output, source.open("rb") as data:
+                shutil.copyfileobj(data, output)
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                # Atomic no-clobber publication, including a target created during the copy.
+                os.link(temporary, target)
+            except FileExistsError as exc:
+                raise ValueError("Capture destination exists; choose another filename") from exc
+        finally:
+            os.unlink(temporary)
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
         shutil.rmtree(stage)
         return {
             "path": str(target),
             "sha256": digest,
-            "width": int.from_bytes(header[16:20]),
-            "height": int.from_bytes(header[20:24]),
+            "width": width,
+            "height": height,
         }
 
 
@@ -323,13 +392,13 @@ def backend_for(root):
     return ImageBackend(store) if store else AppleBackend()
 
 
-def initialize(queue, *, apply=False):
+def initialize(queue, *, apply=False, external_root=None):
     """Explicit provisioning only. Never replace an image or reconfigure live leases."""
     existing = ImageStore.load(queue.root)
     if existing:
         return existing.status()
-    t9 = Path.home() / "Developer"
-    image = t9 / "SimulatorStorage/simqueue.sparsebundle"
+    external_root = Path(external_root or Path.home() / "Developer").expanduser().absolute()
+    image = external_root / "BuildExports/simqueue-storage/simqueue.sparsebundle"
     mount = queue.root / "DeviceVolume"
     if not apply:
         return {
@@ -345,36 +414,24 @@ def initialize(queue, *, apply=False):
             for r in queue.state["requests"].values()
         ):
             raise Attention("Active requests exist; storage reconfiguration refused")
-        check = json.loads(
-            command(
-                [
-                    str(Path.home() / ".local/bin/developer-host"),
-                    "storage",
-                    "--format",
-                    "json",
-                    "--checker-protocol",
-                    "json",
-                ]
-            )
-        )
-        if (
-            check.get("status") != "ready"
-            or check.get("authority", {}).get("verdict") != "verified"
-            or not os.path.ismount(t9)
-        ):
-            raise Attention("T9 readiness could not be verified")
-        t9_info = command(["/usr/sbin/diskutil", "info", "-plist", str(t9)], plist=True)
+        backing_info = verify_readiness(external_root)
         if image.exists() or image.is_symlink():
             raise Attention("Image path already exists; adoption/overwrite refused")
         if mount.exists() and (mount.is_symlink() or any(mount.iterdir())):
             raise Attention("Mount destination already contains data")
+        if image.parent.resolve() != image.parent or mount.resolve() != mount:
+            raise Attention("Storage paths must not traverse symlinks")
+        if mount.is_relative_to(external_root):
+            raise Attention("Image mount point must be internal")
         image.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if image.parent.stat().st_dev != external_root.stat().st_dev:
+            raise Attention("Image parent must remain on the verified external filesystem")
         intent = {
             "image": str(image),
             "mount": str(mount),
-            "t9_root": str(t9),
-            "t9_uuid": t9_info["VolumeUUID"],
-            "version": 1,
+            "external_root": str(external_root),
+            "external_uuid": backing_info["VolumeUUID"],
+            "version": 2,
         }
         atomic_json(queue.root / "storage-setup-intent.json", intent)
         command(

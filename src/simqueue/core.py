@@ -304,18 +304,16 @@ class Queue:
                     if len(matches) != 1:
                         raise Attention("Uncertain create intent; preserve and reconcile")
                     d["uuid"] = matches[0]["udid"]
-                    d["state"] = "ready"
-                    r = self.state["requests"][d["request_id"]]
-                    if r["state"] == "creating":
-                        r["state"] = "granted"
-                    self.save({"event": "create-reconciled", "device_id": did})
+                    # Identifying a UUID does not prove post-create initialization finished.
+                    self.save({"event": "create-identified", "device_id": did})
                 actual = self.checked_device(d, devices)
                 if d["state"] == "creating" and actual is not None:
-                    d["state"] = "ready"
                     request = self.state["requests"][d["request_id"]]
                     if request["state"] == "creating":
+                        self.backend.validate_created(d["uuid"], d["runtime"])
+                        d["state"] = "ready"
                         request["state"] = "granted"
-                    self.save({"event": "create-reconciled", "device_id": did})
+                        self.save({"event": "create-reconciled", "device_id": did})
                 if self.holders(did):
                     if actual is None:
                         raise Attention("A leased device disappeared; no replacement was created")
@@ -387,6 +385,7 @@ class Queue:
                 d["uuid"] = created
                 if self.checked_device(d, self.backend.devices()) is None:
                     raise Attention("Created device is not yet visible; reconcile the intent")
+                self.backend.validate_created(created, d["runtime"])
                 r["state"] = "granted"
                 d["state"] = "ready"
                 self.save({"event": "granted", "request_id": r["id"], "device_id": did})
@@ -457,7 +456,7 @@ class Queue:
             return {"tracked": True, "pid": pid}
 
     def boot(self, token):
-        with self.locked():
+        with self.locked(), self.backend.operation_budget():
             r = self.request(token)
             if r["state"] != "granted":
                 raise ValueError("An active lease is required")
@@ -467,32 +466,38 @@ class Queue:
                 raise Attention("Managed device is missing")
             if a["state"] == "Shutdown":
                 self.backend.boot(d["uuid"])
-            return self.public(r)
+            elif a["state"] == "Booted":
+                self.backend.wait_ready(d["uuid"])
+            else:
+                raise Attention("Managed device is transitioning; native readiness unverified")
+            return {**self.public(r), "boot_ready": True}
 
     def install(self, token, app_path):
-        with self.locked():
+        with self.locked(), self.backend.operation_budget():
             r = self.request(token)
             if r["state"] != "granted":
                 raise ValueError("An active lease is required")
             if not hasattr(self.backend, "install"):
-                raise Attention("Managed install requires the T9 image backend")
+                raise Attention("Managed install requires the external storage image backend")
             d = self.state["devices"][r["device_id"]]
             actual = self.checked_device(d, self.backend.devices())
             if actual is None or actual["state"] != "Booted":
                 raise Attention("Managed device must be booted for install")
+            self.backend.wait_ready(d["uuid"])
             return self.backend.install(d["uuid"], app_path)
 
     def capture(self, token, filename="screenshot.png"):
-        with self.locked():
+        with self.locked(), self.backend.operation_budget():
             r = self.request(token)
             if r["state"] != "granted":
                 raise ValueError("An active lease is required")
             if not hasattr(self.backend, "capture"):
-                raise Attention("Managed capture requires the T9 image backend")
+                raise Attention("Managed capture requires the external storage image backend")
             d = self.state["devices"][r["device_id"]]
             actual = self.checked_device(d, self.backend.devices())
             if actual is None or actual["state"] != "Booted":
                 raise Attention("Managed device must be booted for capture")
+            self.backend.wait_ready(d["uuid"])
             return self.backend.capture(d["uuid"], r["id"], filename)
 
     def status(self, sweep=False):

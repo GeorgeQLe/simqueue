@@ -11,6 +11,6 @@ state must preserve devices and report attention. Never uninstall shared runtime
 No arbitrary command execution tool or HTTP listener. Tokens are local bearer
 capabilities: redact them from status, diagnostics, logs and committed fixtures.
 
-All test scratch, dependencies and build outputs live on T9. Real acceptance uses
+All test scratch, dependencies and build outputs live on the verified external developer volume. Real acceptance uses
 separate state, records every created UUID and removes only those devices in a
 finally block. Never test deletion against a user's existing devices.

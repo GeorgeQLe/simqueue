@@ -39,7 +39,7 @@ installation bridge to reply. Cold installation/LaunchServices work is a plausib
 contributor; the exact Apple-side cause remains **open**.
 
 Follow-up runs of the same simulator app completed on internal storage in 14.8
-seconds and on the T9-backed image in 54.4 seconds. Those runs support a bounded
+seconds and on the original host’s T9-backed image in 54.4 seconds. Those runs support a bounded
 wait mitigation, but do not prove that increasing the timeout permanently resolves
 every stall. App installation, a live process and a visible app screen are separate
 checks. Separate Apple `AppIntentsLiveEntityService` assertion crashes were also
@@ -64,7 +64,7 @@ beta runtime. No automatic service restart or shared-runtime replacement is used
    `device_set` to `simctl --set` (and `SIMULATOR_DEVICE_SET_PATH` for Xcode tests).
 4. `track_process(lease_token, pid)` for every build/test process that might outlive
    the task or its MCP server. Registration records PID plus start identity.
-5. In `finally`, wait for those processes, retain requested evidence on T9, then
+5. In `finally`, wait for those processes, retain requested evidence on external developer storage, then
    `release(lease_token)`. A queued request is cancelled by the same operation.
 6. Confirm `device_state: deleted`. An `attention` result means preservation and
    follow-up are required. `sweep` retries safe reconciliation; it never force-deletes.
@@ -109,15 +109,15 @@ Expired/released token records are retained for seven days after device cleanup.
 
 The small live journal defaults to `~/Library/Application Support/simqueue`. Source,
 virtual environment, dependency caches, scratch and retained test evidence belong on
-T9. With the image connection configured, disposable device data lives in an APFS
-sparsebundle on T9 and is removed at the end of the task. Disconnecting T9 prevents
+the external developer volume. With the image connection configured, disposable device data lives in an APFS
+sparsebundle on the external volume and is removed at the end of the task. Disconnecting that volume prevents
 the tool from running; reconnect it and sweep to complete interrupted cleanup. Regular working simulators
 and shared runtime installations remain internal.
 
-## T9 image connection (0.2)
+## External APFS image connection (0.2)
 
-Direct `simctl --set` on this Mac's removable T9 fails CoreSimulator's file access
-checks. An APFS sparsebundle backed by T9, mounted at a stable local connection
+On the original host, direct `simctl --set` on removable T9 failed CoreSimulator's
+file access checks. An APFS sparsebundle backed by the external drive, mounted at a stable local connection
 point, was verified to create and boot a device and run an existing simulator app.
 This uses normal Apple disk-image commands without changing privacy permissions.
 Shared runtime installations and existing regular simulators remain internal.
@@ -129,11 +129,11 @@ simqueue storage-status
 simqueue storage-detach           # Only when all managed work is finished
 ```
 
-On this Mac the backing image is `~/Developer/SimulatorStorage/simqueue.sparsebundle`,
+On this Mac the backing image is `~/Developer/BuildExports/simqueue-storage/simqueue.sparsebundle`,
 with a 64 GB maximum virtual size; physical allocation grows as files are written.
 Deleted device space is reusable inside the image; backing bands do not necessarily shrink immediately.
 It mounts at `~/Library/Application Support/simqueue/DeviceVolume`. Every simulator
-command verifies T9 and image volume identities. Missing or changed storage fails
+command verifies the backing and image volume identities. Missing or changed storage fails
 closed; it never silently writes device data onto the internal mount directory.
 Config and the small ownership journal remain internal. Provisioning refuses active
 leases or existing image files; interrupted setup leaves an intent for inspection.
@@ -146,41 +146,49 @@ A busy coordinator returns a retry error; retain the original lease capability.
 
 After `boot`, use `install(lease_token, app_path)` for a built simulator `.app`:
 it stages the app inside the image so Apple's service can read it, installs it and
-removes its temporary copy. Launch through `apple-tools xcrun simctl --set <device_set>
-launch <uuid> <bundle_id>`. Build with explicit T9 derived-data/result paths.
+removes its temporary copy. Launch through `xcrun simctl --set <device_set>
+launch <uuid> <bundle_id>` (prefix with `apple-tools` on hosts that require it). Build with explicit external derived-data/result paths.
 Use `capture(lease_token, filename)` for screenshots: Apple's producer writes inside
-the image, then the wrapper validates the PNG and exports it to T9
+the image, then the wrapper validates the PNG and exports it to external developer storage
 `Artifacts/simqueue-captures/<request-id>/`. It returns path, dimensions and SHA-256.
 Failed import/export staging is preserved for diagnosis rather than silently discarded.
 Boot can take several minutes; configure the MCP tool timeout to at least 360 seconds.
 
-`scripts/image_acceptance.py --output <unique-T9-artifact-directory>` exercises the
+`scripts/image_acceptance.py --output <unique-artifact-directory> --runtime <installed-id>` exercises the
 installed launcher through two independent MCP connections, sharing protection,
 app installation/launch, screenshot export, final deletion and normal image eject.
-It uses an existing Puzzle Quest simulator build and verifies regular devices are
-unchanged. The older `acceptance.py` uses an isolated internal test queue.
+It uses an existing Puzzle Quest simulator build (or `--app /path/to/Simulator.app`)
+and accepts `--device-type` for another installed device. Run before enabling clients
+or the sweeper: it requires an idle coordinator, holds its lock throughout, and uses a separate acceptance
+journal inside its output directory, sharing the configured image only for the test.
+It verifies pre-existing device UUIDs remain and reports observed boot-state changes
+without mutating those devices. Other tasks may use them during acceptance. The older `acceptance.py` uses an isolated internal test queue.
 
 ## Contacts migration startup workaround (0.2.2)
 
-On this host, fresh iOS 26.5 (23F77) and iOS 27.0 (24A5390f) devices with Apple's
+On this host, fresh iOS 26.3, iOS 26.5 (23F77) and iOS 27.0 (24A5390f) devices with Apple's
 bundled sample Contacts data crash in `CNContactPosterMigrator performMigration`
 (`CFArrayGetCount` receives a null array). The macOS crash dialog may appear or
 remain visible later, including after the simulator has shut down.
 
-For those two runtime identifiers, the image backend moves the sample AddressBook
+For those three runtime identifiers, the image backend moves the sample AddressBook
 seed aside immediately after creating a new disposable device, before its first
 boot. iOS then initializes an empty Contacts database normally. The original seed
 is preserved inside that same disposable device until normal final-release cleanup.
 No migration service is disabled, crash reporting remains enabled, and no shared
 runtime or existing simulator is modified. Contacts tests must supply their own
 fixtures rather than depend on Apple's bundled sample contacts. Other runtimes
-retain their normal initialization behavior.
+retain their normal initialization behavior. On the T7 host, iOS 26.3 reproduced the
+same migration crash. Its fresh-device seed workaround prevented that migration
+crash in the next run, but Contacts launch still timed out. App lifecycle acceptance
+passed separately with `--skip-contacts`; Contacts acceptance remains unresolved.
+See [T7 verification](VERIFICATION.md#t7-installation-and-portable-storage--6-november-2026).
 
 The installed-launcher app acceptance now checks Contacts launch and screenshot,
 Puzzle Quest launch and screenshot, absence of device-specific migration crash
 reports, shared-holder protection and verified cleanup. The crash-report reader
 matches the simulator coalition UUID, so another task's crash cannot fail the test.
-The acceptance runner keeps private, mode-0600 cleanup capabilities in its T9 run
+The acceptance runner keeps private, mode-0600 cleanup capabilities in its external developer storage run
 directory until verified cleanup succeeds. If cleanup fails, preserve that file,
 recover with the original capabilities, and remove it only after verified deletion.
 Never copy those credentials into reports or Git.
@@ -191,19 +199,21 @@ Requirements: macOS with Xcode and its command-line tools, an installed simulato
 runtime, Python 3.11+, and `uv`. The official MCP Python SDK v2 and development tools
 are pinned in `uv.lock`.
 
-The current Apple backend invokes `~/.local/bin/apple-tools xcrun simctl ...`.
-That host-provided wrapper selects the intended Xcode and isolates Apple's tool
-PATH; **it is not bundled here**. Supply that wrapper on another host before native
-simulator operations. The queue tests use a fake backend and need no running
-simulator.
+The Apple backend uses `~/.local/bin/apple-tools xcrun simctl ...` when that
+host wrapper is present. Otherwise it uses `/usr/bin/xcrun simctl ...` with the
+selected Xcode (or `DEVELOPER_DIR`). No wrapper installation is required.
 
-The optional external-image integration is currently specific to the original host:
-it expects external storage mounted at `~/Developer` and a `~/.local/bin/developer-host`
-helper returning verified JSON storage readiness. That helper is also not bundled.
-The image backing path and mount point are provisioned by `storage-init`; this is
-not a general external-drive configuration wizard. Review `src/simqueue/storage.py`
-and adapt host integration before provisioning elsewhere. Without image configuration,
-the backend uses the normal internal device set.
+External-image storage accepts any drive label. It defaults to the external APFS
+volume mounted at `~/Developer`; use `simqueue storage-init --storage-root /absolute/mount`
+to select another physical mount before provisioning. Each operation verifies the
+configured backing volume UUID, external/writable APFS properties, image path and
+mounted image identity. Missing or replaced storage fails closed. If the host has
+`~/.local/bin/developer-host`, its verified readiness check is also required before
+provisioning or attaching; hosts without that helper use native macOS verification.
+This is host-local verification, not a distributed writer lease or fleet enrollment.
+Config version 2 uses `external_root` and `external_uuid`; version 1 `t9_root` and
+`t9_uuid` configurations remain readable without rewriting or adopting their images.
+Without image configuration, the backend uses the normal internal device set.
 
 Clone the public repository, then install dependencies:
 
@@ -214,7 +224,7 @@ uv sync --locked
 uv run simqueue --help
 ```
 
-On the original T9-configured host, verify `developer-host storage` and use:
+Install the launcher and sweep definition after verifying the external volume:
 
 ```sh
 UV_CACHE_DIR="$HOME/Developer/PackageCaches/uv" uv sync --locked
@@ -244,6 +254,38 @@ Do not change capacity while leases exist. Every process (including the sweeper)
 use the same `--max-devices` setting. Default is two. An alternate state directory is
 for isolated acceptance tests, not normal agents.
 
+## Readiness and recovery checks
+
+`device_state: ready` means allocation is complete. It does not establish native
+boot readiness. A successful `boot` now returns `boot_ready: true`, rechecks
+`bootstatus` even when inventory already says `Booted`, and verifies the device
+has not stopped during the wait. `install` and `capture` each check native
+readiness again before doing app or framebuffer work. A timeout remains uncertain;
+never substitute polling, a service PID or `Booted` inventory for successful boot.
+Readiness also does not establish that an app's assets have finished rendering.
+The native acceptance runner allows 180 seconds for app launch: a cold 16e/iOS
+26.3.1 launch on the 8 GB T7 host completed in 95.8 seconds. It still requires a
+live app and screenshot evidence; elapsed waiting alone is not acceptance.
+
+Inventory, readiness and subsequent native commands share one operation deadline
+(120 seconds for the internal backend, 300 seconds for the image backend). File
+staging and storage checks consume elapsed time rather than starting a fresh
+native wait window. These are native-command limits, not hard interruption of
+filesystem I/O; retain client transport overhead as described above.
+
+Recovery of an interrupted image-device create must verify the affected runtime's
+Contacts initialization marker and preserved seed before granting its lease. A
+missing or inconsistent proof preserves the device for inspection; release can
+still clean up that exact journal-owned resource. Recovery never reruns the seed
+workaround against a device that might already have booted.
+
+Screenshot export validates PNG chunks/checksums, compressed pixel lengths and
+row filters, including interlaced images. Limits are 64 MiB encoded and 16 million
+pixels. Invalid producer output remains staged for diagnosis. Export uses a unique
+temporary file and atomic no-clobber publication, so existing destinations and
+partial-file symlinks are preserved. Integrity checks establish a complete image;
+visually inspect it to establish which app or screen rendered.
+
 ## CLI and verification
 
 `simqueue inventory`, `simqueue status`, `simqueue sweep`.
@@ -255,12 +297,12 @@ status rather than submitting repeated requests. There is no network listener or
 arbitrary shell-command tool.
 
 ```sh
-developer-host python-exec --venv "$PWD/.venv" -- -m pytest -q \
-  --basetemp="$DEVELOPER_SCRATCH_ROOT/simqueue-tests"
-developer-host python-exec --venv "$PWD/.venv" -- -m ruff check src tests scripts
+.venv/bin/python -m pytest -q \
+  --basetemp="$HOME/Developer/Scratch/simqueue-tests"
+.venv/bin/ruff check src tests scripts
 ```
 
-`scripts/acceptance.py --output <unique-T9-task-directory>` explicitly runs the real
+`scripts/acceptance.py --output <unique-artifact-directory>` explicitly runs the real
 simulator test. It inventories existing devices, uses two stdio MCP servers, boots
 one fresh device, checks shared/process protection and FIFO handoff, then verifies
 both disposable UUIDs and directories are gone and pre-existing devices unchanged.
@@ -278,4 +320,4 @@ Release and verify all leases first. Run `codex mcp remove simqueue` and
 `launchctl bootout "gui/$(id -u)/com.georgele.simqueue.sweep"`, then remove only the managed
 launcher and LaunchAgent definition. Preserve the live journal until every owned
 device is verified deleted. Configuration backups and local acceptance evidence are
-retained separately on T9; they are never committed to this repository.
+retained separately on external developer storage; they are never committed to this repository.

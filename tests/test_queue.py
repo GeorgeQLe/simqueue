@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import uuid
@@ -15,6 +16,12 @@ class Backend:
         self.fail_create = False
         self.fail_delete = False
         self.fail_inventory = False
+
+    def operation_budget(self):
+        return contextlib.nullcontext()
+
+    def validate_created(self, uid, runtime):
+        pass
 
     def validate(self, device_type, runtime):
         if (device_type, runtime) != ("phone", "ios"):
@@ -46,6 +53,10 @@ class Backend:
 
     def boot(self, uid):
         self.items[uid]["state"] = "Booted"
+        self.wait_ready(uid)
+
+    def wait_ready(self, uid):
+        pass
 
     def shutdown(self, uid):
         self.items[uid]["state"] = "Shutdown"

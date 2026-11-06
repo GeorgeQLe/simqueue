@@ -1,8 +1,11 @@
 """Bounded Apple-tool operations. No caller-supplied executable or device-set path."""
 
+import contextlib
+import contextvars
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -11,16 +14,39 @@ class Attention(RuntimeError):
 
 
 class AppleBackend:
+    operation_timeout = 120
+
     def __init__(self):
+        self._deadline = contextvars.ContextVar("simqueue-native-deadline", default=None)
         self.wrapper = Path.home() / ".local/bin/apple-tools"
+        self.tool_command = (
+            [str(self.wrapper), "xcrun"] if self.wrapper.exists() else ["/usr/bin/xcrun"]
+        )
         self.device_root = Path.home() / "Library/Developer/CoreSimulator/Devices"
 
+    @contextlib.contextmanager
+    def operation_budget(self):
+        """Share a native-command budget across inventory, readiness and the operation."""
+        previous = self._deadline.get()
+        deadline = time.monotonic() + self.operation_timeout
+        token = self._deadline.set(min(previous, deadline) if previous is not None else deadline)
+        try:
+            yield
+        finally:
+            self._deadline.reset(token)
+
     def run(self, *args, timeout=45):
+        deadline = self._deadline.get()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Attention("Native operation budget exhausted; outcome uncertain, reconcile")
+            timeout = min(timeout, remaining)
         env = dict(os.environ)
         env.pop("SIMULATOR_DEVICE_SET_PATH", None)
         try:
             p = subprocess.run(
-                [str(self.wrapper), "xcrun", "simctl", "--set", str(self.device_root), *args],
+                [*self.tool_command, "simctl", "--set", str(self.device_root), *args],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -29,7 +55,7 @@ class AppleBackend:
             )
         except subprocess.TimeoutExpired as exc:
             raise Attention(
-                f"simctl {args[0]} exceeded {timeout}s; outcome uncertain, reconcile before retrying"
+                f"simctl {args[0]} exceeded {timeout:.1f}s; outcome uncertain, reconcile before retrying"
             ) from exc
         except OSError as exc:
             raise Attention("simctl could not start; inspect the local Apple toolchain") from exc
@@ -66,9 +92,19 @@ class AppleBackend:
     def create(self, name, device_type, runtime):
         return self.run("create", name, device_type, runtime).strip()
 
+    def validate_created(self, uuid, runtime):
+        """Backend-specific initialization proof for a journal-owned create intent."""
+
     def boot(self, uuid):
         self.run("boot", uuid)
-        self.run("bootstatus", uuid, "-b", timeout=120)
+        self.wait_ready(uuid)
+
+    def wait_ready(self, uuid):
+        """Require native terminal readiness even when inventory already says Booted."""
+        self.run("bootstatus", uuid, timeout=self.operation_timeout)
+        # Another holder may have shut the device down while bootstatus was waiting.
+        if self.devices().get(uuid, {}).get("state") != "Booted":
+            raise Attention("Device stopped during readiness check; native readiness unverified")
 
     def shutdown(self, uuid):
         self.run("shutdown", uuid)

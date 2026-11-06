@@ -14,7 +14,7 @@ def main():
     repo = Path(__file__).resolve().parents[1]
     executable = repo / ".venv/bin/simqueue"
     if not executable.is_file():
-        raise SystemExit("Run uv sync --locked in the T9 checkout first")
+        raise SystemExit("Run uv sync --locked in the external storage checkout first")
     launcher = Path.home() / ".local/bin/simqueue"
     marker = "# simqueue managed launcher"
     if launcher.exists() and marker not in launcher.read_text():

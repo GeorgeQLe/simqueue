@@ -31,6 +31,7 @@ def main():
     )
     parser.add_argument("tool", nargs="?", help="For call: arguments come from JSON on stdin")
     parser.add_argument("--apply", action="store_true", help="Apply explicit storage provisioning")
+    parser.add_argument("--storage-root", type=Path, help="External APFS mount for storage-init")
     args = parser.parse_args()
     q = Queue(args.state_dir, backend_for(args.state_dir), max_devices=args.max_devices)
     if args.command == "serve":
@@ -40,7 +41,7 @@ def main():
         return
     try:
         if args.command == "storage-init":
-            result = initialize(q, apply=args.apply)
+            result = initialize(q, apply=args.apply, external_root=args.storage_root)
         elif args.command == "storage-status":
             result = (
                 q.backend.store.status() if hasattr(q.backend, "store") else {"mode": "internal"}

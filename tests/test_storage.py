@@ -44,7 +44,13 @@ def store(tmp_path, monkeypatch):
             return {"images": [attachment] if str(mount) in mounted else []}
         if args[:2] == ["/usr/sbin/diskutil", "info"]:
             return (
-                {"VolumeUUID": "t9-uuid"}
+                {
+                    "VolumeUUID": "t9-uuid",
+                    "MountPoint": str(t9),
+                    "Internal": False,
+                    "FilesystemType": "apfs",
+                    "WritableVolume": True,
+                }
                 if args[-1] == str(t9)
                 else {"VolumeUUID": "image-uuid", "MountPoint": str(mount)}
             )
@@ -71,8 +77,8 @@ def test_existing_mount_and_backing_identity(store):
 
 def test_missing_t9_never_mounts_or_falls_back(store):
     s, mounted, _, command = store
-    mounted.remove(str(s.t9))
-    with pytest.raises(Attention, match="T9 is not mounted"):
+    mounted.remove(str(s.external_root))
+    with pytest.raises(Attention, match="External storage is not mounted"):
         s.ensure()
     command.assert_not_called()
 
@@ -130,7 +136,7 @@ def test_capture_stages_on_image_then_exports_to_t9(store):
     s, _, _, _ = store
     b = ImageBackend(s)
     png = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aEnEAAAAASUVORK5CYII="
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMQVDIGAACuAGcVHqFfAAAAAElFTkSuQmCC"
     )
 
     def screenshot(*args, **kwargs):
@@ -141,7 +147,7 @@ def test_capture_stages_on_image_then_exports_to_t9(store):
     b.run = screenshot
     result = b.capture("owned-uuid", "owned-request", "test.png")
     assert Path(result["path"]).read_bytes() == png
-    assert Path(result["path"]).is_relative_to(s.t9)
+    assert Path(result["path"]).is_relative_to(s.external_root)
     assert (result["width"], result["height"]) == (1, 1)
     with pytest.raises(ValueError):
         b.capture("owned-uuid", "owned-request", "../outside.png")
@@ -160,7 +166,7 @@ def test_install_stages_on_image_and_removes_only_own_copy(store, monkeypatch):
     import plistlib
 
     s, _, _, _ = store
-    app = s.t9 / "Example.app"
+    app = s.external_root / "Example.app"
     app.mkdir()
     (app / "Info.plist").write_bytes(
         plistlib.dumps(
@@ -193,6 +199,7 @@ def test_interrupted_setup_cannot_fall_back_internally(tmp_path):
 @pytest.mark.parametrize(
     "runtime",
     [
+        "com.apple.CoreSimulator.SimRuntime.iOS-26-3",
         "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
         "com.apple.CoreSimulator.SimRuntime.iOS-27-0",
     ],
@@ -243,7 +250,7 @@ def test_fresh_contacts_symlink_is_preserved_and_refused(store, monkeypatch):
 
     s, _, _, _ = store
     backend = ImageBackend(s)
-    outside = s.t9 / "regular-contacts"
+    outside = s.external_root / "regular-contacts"
     outside.mkdir()
     (outside / "user-data").write_text("preserve")
     seed = backend.device_root / "new-device/data/Library/AddressBook"
@@ -259,7 +266,7 @@ def test_install_timeout_preserves_stage_without_claiming_success(store, monkeyp
     import plistlib
 
     s, _, _, _ = store
-    app = s.t9 / "Uncertain.app"
+    app = s.external_root / "Uncertain.app"
     app.mkdir()
     (app / "Info.plist").write_bytes(
         plistlib.dumps(
@@ -281,3 +288,96 @@ def test_install_timeout_preserves_stage_without_claiming_success(store, monkeyp
     assert len(stages) == 1
     assert (stages[0] / "Info.plist").read_bytes() == (app / "Info.plist").read_bytes()
     assert app.exists()
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_generic_and_legacy_storage_pin_uuid_without_drive_name(store, version):
+    s, _, _, _ = store
+    config = dict(s.config)
+    if version == 2:
+        config.update(
+            version=2, external_root=config.pop("t9_root"), external_uuid=config.pop("t9_uuid")
+        )
+    generic = ImageStore(s.root, config)
+    generic.ensure()
+    assert generic.status()["mode"] == "external-apfs-image"
+    generic.external_uuid = "different-volume"
+    with pytest.raises(Attention, match="identity changed"):
+        generic.ensure()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("Internal", True),
+        ("WritableVolume", False),
+        ("FilesystemType", "exfat"),
+        ("MountPoint", "/different/mount"),
+    ],
+)
+def test_unsuitable_backing_volume_is_rejected_before_attach(store, field, value):
+    s, mounted, _, command = store
+    mounted.remove(str(s.mount))
+    original = command.side_effect
+
+    def changed(args, **kwargs):
+        result = original(args, **kwargs)
+        if args[:2] == ["/usr/sbin/diskutil", "info"] and args[-1] == str(s.external_root):
+            return {**result, field: value}
+        return result
+
+    command.side_effect = changed
+    with pytest.raises(Attention, match="could not be verified"):
+        s.ensure()
+    assert not any("attach" in c.args[0] for c in command.call_args_list)
+
+
+def test_storage_preview_accepts_generic_mount_without_writing(setup, tmp_path):
+    q, _, _, _ = setup
+    external = tmp_path / "AnyDriveLabel"
+    preview = initialize(q, external_root=external)
+    assert preview["image"] == str(external / "BuildExports/simqueue-storage/simqueue.sparsebundle")
+    assert not external.exists()
+
+
+def test_native_apple_toolchain_when_host_wrapper_missing(monkeypatch, tmp_path):
+    from simqueue.backend import AppleBackend
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    backend = AppleBackend()
+    assert backend.tool_command == ["/usr/bin/xcrun"]
+    wrapper = tmp_path / ".local/bin/apple-tools"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.touch()
+    assert AppleBackend().tool_command == [str(wrapper), "xcrun"]
+
+
+def test_existing_host_readiness_failure_is_not_bypassed(store, monkeypatch):
+    s, mounted, _, command = store
+    mounted.remove(str(s.mount))
+    helper = s.root / ".local/bin/developer-host"
+    helper.parent.mkdir(parents=True)
+    helper.touch()
+    monkeypatch.setattr(Path, "home", lambda: s.root)
+    original = command.side_effect
+
+    def unready(args, **kwargs):
+        if args[0] == str(helper):
+            return b'{"status": "blocked", "authority": {"verdict": "unverified"}}'
+        return original(args, **kwargs)
+
+    command.side_effect = unready
+    with pytest.raises(Attention, match="readiness could not be verified"):
+        s.ensure()
+    assert not any("attach" in c.args[0] for c in command.call_args_list)
+
+
+def test_backing_image_symlink_is_preserved(store):
+    s, _, _, _ = store
+    s.image.rmdir()
+    outside = s.root / "unrelated"
+    outside.mkdir()
+    s.image.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(Attention, match="missing or replaced"):
+        s.ensure()
+    assert s.image.is_symlink() and outside.is_dir()

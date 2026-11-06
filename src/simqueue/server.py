@@ -23,6 +23,7 @@ def make_server(queue):
             "Acquire an isolated simulator lease. Poll/heartbeat queued requests. "
             "Use its returned device_set with simctl --set and only its returned UUID. Share only by explicit sharing capability. "
             "Register test process PIDs before releasing. Release in finally, then verify cleanup. "
+            "Allocation ready does not mean boot ready. Call boot and require success before app work. "
             "Keep capability tokens private; status never returns them."
         ),
     )
@@ -75,14 +76,14 @@ def make_server(queue):
 
     @server.tool(structured_output=True)
     def install(lease_token: str, app_path: str) -> dict[str, Any]:
-        """Stage a built simulator .app inside the T9 image, install it on the booted
+        """Stage a built simulator .app inside the external storage image, install it on the booted
         leased UUID, then remove the staging copy. Returns its bundle identifier."""
         return invoke(queue.install, lease_token, app_path)
 
     @server.tool(structured_output=True)
     def capture(lease_token: str, filename: str = "screenshot.png") -> dict[str, Any]:
         """Capture a booted leased device inside the image, then export a validated PNG
-        to T9. Use this instead of asking Apple's screenshot service to write directly
+        to external storage. Use this instead of asking Apple's screenshot service to write directly
         to a removable volume. Returns a retained path, dimensions and SHA-256."""
         return invoke(queue.capture, lease_token, filename)
 
