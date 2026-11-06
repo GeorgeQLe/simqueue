@@ -12,7 +12,8 @@ and device directory are gone.
 2. `acquire(owner, task, device_type, runtime)`: retain the returned private
    `lease_token`. A queued request has no device yet. Poll it; do not submit duplicates.
 3. `heartbeat(lease_token)` before expiry (default 900 seconds). `boot` the granted
-   device and target only its returned UUID in tests.
+   device and target only its returned UUID in tests. Always pass its returned
+   `device_set` to `simctl --set` (and `SIMULATOR_DEVICE_SET_PATH` for Xcode tests).
 4. `track_process(lease_token, pid)` for every build/test process that might outlive
    the task or its MCP server. Registration records PID plus start identity.
 5. In `finally`, wait for those processes, retain requested evidence on T9, then
@@ -60,10 +61,57 @@ Expired/released token records are retained for seven days after device cleanup.
 
 The small live journal defaults to `~/Library/Application Support/simqueue`. Source,
 virtual environment, dependency caches, scratch and retained test evidence belong on
-T9. CoreSimulator's managed device data stays in its standard internal location and
-is removed at the end of the task. Disconnecting T9 prevents the tool from running;
+T9. With the image connection configured, disposable device data lives in an APFS
+sparsebundle on T9 and is removed at the end of the task. Disconnecting T9 prevents
+the tool from running;
 reconnect it and sweep to complete interrupted cleanup. Regular working simulators
 and shared runtime installations remain internal.
+
+## T9 image connection (0.2)
+
+Direct `simctl --set` on this Mac's removable T9 fails CoreSimulator's file access
+checks. An APFS sparsebundle backed by T9, mounted at a stable local connection
+point, was verified to create and boot a device and run an existing simulator app.
+This uses normal Apple disk-image commands without changing privacy permissions.
+Shared runtime installations and existing regular simulators remain internal.
+
+```sh
+simqueue storage-init             # Preview; does not create an image
+simqueue storage-init --apply     # Explicit, one-time provisioning
+simqueue storage-status
+simqueue storage-detach           # Only when all managed work is finished
+```
+
+On this Mac the backing image is `~/Developer/SimulatorStorage/simqueue.sparsebundle`,
+with a 64 GB maximum virtual size; physical allocation grows as files are written. Deleted device space is reusable
+inside the image; backing bands do not necessarily shrink immediately.
+It mounts at `~/Library/Application Support/simqueue/DeviceVolume`. Every simulator
+command verifies T9 and image volume identities. Missing or changed storage fails
+closed; it never silently writes device data onto the internal mount directory.
+Config and the small ownership journal remain internal. Provisioning refuses active
+leases or existing image files; interrupted setup leaves an intent for inspection.
+
+`inventory`/allocation lazily attach the configured image. Empty periodic sweeps do
+not attach it. `storage-detach` refuses held, pending or uncertain work and requires
+an empty custom device inventory; it performs a normal eject, never a force eject.
+Protected ready devices do not trigger expensive periodic native inventory probes.
+A busy coordinator returns a retry error; retain the original lease capability.
+
+After `boot`, use `install(lease_token, app_path)` for a built simulator `.app`:
+it stages the app inside the image so Apple's service can read it, installs it and
+removes its temporary copy. Launch through `apple-tools xcrun simctl --set <device_set>
+launch <uuid> <bundle_id>`. Build with explicit T9 derived-data/result paths.
+Use `capture(lease_token, filename)` for screenshots: Apple's producer writes inside
+the image, then the wrapper validates the PNG and exports it to T9
+`Artifacts/simqueue-captures/<request-id>/`. It returns path, dimensions and SHA-256.
+Failed import/export staging is preserved for diagnosis rather than silently discarded.
+Boot can take several minutes; configure the MCP tool timeout to at least 360 seconds.
+
+`scripts/image_acceptance.py --output <unique-T9-artifact-directory>` exercises the
+installed launcher through two independent MCP connections, sharing protection,
+app installation/launch, screenshot export, final deletion and normal image eject.
+It uses an existing Puzzle Quest simulator build and verifies regular devices are
+unchanged. The older `acceptance.py` uses an isolated internal test queue.
 
 ## Install on this Mac
 

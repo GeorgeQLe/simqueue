@@ -25,7 +25,12 @@ def test_sdk_protocol(tmp_path, mode):
                 "status",
                 "sweep",
                 "inventory",
+                "capture",
+                "install",
             }
+            invalid = await client.call_tool("release", {"lease_token": "invalid"})
+            assert invalid.is_error
+            assert "Unknown lease capability" in str(invalid.content)
             result = await client.call_tool(
                 "acquire",
                 {

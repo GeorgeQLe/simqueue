@@ -287,3 +287,14 @@ def test_missing_device_with_remaining_data_blocks_capacity(setup):
     result = q.release(a["lease_token"])
     assert "directory remains" in result["attention"]
     assert acquire(q)["state"] == "queued"
+
+
+def test_sweeper_skips_protected_ready_devices(setup):
+    q, b, _, _ = setup
+    held = acquire(q)
+    b.fail_inventory = True
+    result = q.status(sweep=True)
+    assert result["attention"] is None
+    assert result["requests"][0]["state"] == "granted"
+    b.fail_inventory = False
+    assert q.release(held["lease_token"])["device_state"] == "deleted"

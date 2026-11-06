@@ -86,6 +86,19 @@ class Queue:
                     "requests": {},
                     "events": [],
                 }
+            namespace = str(getattr(self.backend, "device_root", "test-backend"))
+            previous = self.state.get("backend_key")
+            if previous is None and any(
+                d["state"] != "deleted" for d in self.state["devices"].values()
+            ):
+                expected = str(Path.home() / "Library/Developer/CoreSimulator/Devices")
+                if namespace not in (expected, "test-backend"):
+                    raise Attention("Legacy ownership journal requires its original device set")
+            if previous is not None and previous != namespace:
+                raise Attention(
+                    "Device set changed; restart this client with the configured backend"
+                )
+            self.state["backend_key"] = namespace
             self.prune()
             yield
         finally:
@@ -112,9 +125,9 @@ class Queue:
             require(type(r["expires"]) in (int, float))
             require(isinstance(r["runtime"], str) and isinstance(r["device_type"], str))
 
-    def maintain_safely(self):
+    def maintain_safely(self, inspect_active=True):
         try:
-            self.maintenance()
+            self.maintenance(inspect_active=inspect_active)
         except Attention as exc:
             self.state["attention"] = str(exc)
             self.save()
@@ -220,6 +233,9 @@ class Queue:
             "task": r["task"],
             "expires": r["expires"],
             "uuid": d.get("uuid"),
+            "device_set": str(self.backend.device_root)
+            if hasattr(self.backend, "device_root")
+            else None,
             "device_state": d.get("state"),
             "device_type": r["device_type"],
             "runtime": r["runtime"],
@@ -249,7 +265,7 @@ class Queue:
             raise Attention("Managed device identity changed; deletion refused")
         return actual
 
-    def maintenance(self):
+    def maintenance(self, inspect_active=True):
         now = self.clock()
         for r in self.state["requests"].values():
             if r["state"] in ("queued", "granted", "creating") and r["expires"] <= now:
@@ -260,6 +276,18 @@ class Queue:
                 if r["state"] == "queued" or dead:
                     r["state"] = "expired"
         self.save()
+        if not any(d["state"] != "deleted" for d in self.state["devices"].values()) and not any(
+            r["state"] in ("queued", "creating", "granted") for r in self.state["requests"].values()
+        ):
+            return
+        live = [(did, d) for did, d in self.state["devices"].items() if d["state"] != "deleted"]
+        pending = any(r["state"] == "queued" for r in self.state["requests"].values())
+        if (
+            not inspect_active
+            and all(d["state"] == "ready" and self.holders(did) for did, d in live)
+            and not (pending and len(live) < self.capacity)
+        ):
+            return
         devices = self.backend.devices()
         for did, d in self.state["devices"].items():
             if d["state"] == "deleted":
@@ -441,12 +469,41 @@ class Queue:
                 self.backend.boot(d["uuid"])
             return self.public(r)
 
+    def install(self, token, app_path):
+        with self.locked():
+            r = self.request(token)
+            if r["state"] != "granted":
+                raise ValueError("An active lease is required")
+            if not hasattr(self.backend, "install"):
+                raise Attention("Managed install requires the T9 image backend")
+            d = self.state["devices"][r["device_id"]]
+            actual = self.checked_device(d, self.backend.devices())
+            if actual is None or actual["state"] != "Booted":
+                raise Attention("Managed device must be booted for install")
+            return self.backend.install(d["uuid"], app_path)
+
+    def capture(self, token, filename="screenshot.png"):
+        with self.locked():
+            r = self.request(token)
+            if r["state"] != "granted":
+                raise ValueError("An active lease is required")
+            if not hasattr(self.backend, "capture"):
+                raise Attention("Managed capture requires the T9 image backend")
+            d = self.state["devices"][r["device_id"]]
+            actual = self.checked_device(d, self.backend.devices())
+            if actual is None or actual["state"] != "Booted":
+                raise Attention("Managed device must be booted for capture")
+            return self.backend.capture(d["uuid"], r["id"], filename)
+
     def status(self, sweep=False):
         with self.locked():
             if sweep:
-                self.maintain_safely()
+                self.maintain_safely(inspect_active=False)
             return {
                 "capacity": self.capacity,
+                "storage": self.backend.store.status()
+                if hasattr(self.backend, "store")
+                else {"mode": "internal"},
                 "attention": self.state.get("attention"),
                 "requests": [self.public(r) for r in self.state["requests"].values()],
                 "devices": [
