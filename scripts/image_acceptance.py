@@ -108,9 +108,11 @@ async def run(output, runtime):
                     break
             if source is None:
                 raise RuntimeError("Existing Puzzle Quest simulator build not found")
+            install_started = time.monotonic()
             installed = await call(
                 a, "install", lease_token=lease["lease_token"], app_path=str(source)
             )
+            report["install_seconds"] = time.monotonic() - install_started
             assert installed["bundle_id"] == bundle
             launched = q.backend.run("launch", uid, bundle)
             pid = int(launched.strip().rsplit(":", 1)[1])
@@ -176,7 +178,7 @@ async def run(output, runtime):
                 after[k]["state"] == before[k]["state"] for k in before
             )
             report["checks"].append(
-                "Internal devices unchanged; test data deleted; image cleanly ejected"
+                "Internal devices unchanged; test data deleted; image ejected when idle"
             )
             report["cleanup_verified"] = True
             if capabilities.exists():

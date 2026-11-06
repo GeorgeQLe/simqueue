@@ -18,7 +18,7 @@ def invoke(operation, *args, **kwargs):
 def make_server(queue):
     server = MCPServer(
         "simqueue",
-        version="0.2.1",
+        version="0.2.2",
         instructions=(
             "Acquire an isolated simulator lease. Poll/heartbeat queued requests. "
             "Use its returned device_set with simctl --set and only its returned UUID. Share only by explicit sharing capability. "

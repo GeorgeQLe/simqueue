@@ -271,7 +271,10 @@ class ImageBackend(AppleBackend):
         stage = Path(tempfile.mkdtemp(prefix="install-", dir=imports))
         app = stage / source.name
         shutil.copytree(source, app, symlinks=False)
-        self.run("install", uuid, str(app), timeout=120)
+        # Cold iOS 27 installs can finish in installd while the bridge still waits
+        # for LaunchServices registration. Keep a finite bound, but allow the same
+        # five-minute startup budget as bootstatus; never infer success from files.
+        self.run("install", uuid, str(app), timeout=300)
         shutil.rmtree(stage)
         return {"installed": True, "bundle_id": bundle, "uuid": uuid}
 

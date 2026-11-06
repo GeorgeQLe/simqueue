@@ -27,8 +27,12 @@ class AppleBackend:
                 timeout=timeout,
                 env=env,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise Attention("simctl timed out; reconcile the recorded operation") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise Attention(
+                f"simctl {args[0]} exceeded {timeout}s; outcome uncertain, reconcile before retrying"
+            ) from exc
+        except OSError as exc:
+            raise Attention("simctl could not start; inspect the local Apple toolchain") from exc
         if p.returncode:
             # Never echo arbitrary process output into a client or audit log.
             raise Attention(f"simctl {args[0]} failed (exit {p.returncode}); inspect locally")

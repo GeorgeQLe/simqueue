@@ -253,3 +253,31 @@ def test_fresh_contacts_symlink_is_preserved_and_refused(store, monkeypatch):
     with pytest.raises(Attention, match="unverifiable"):
         backend.create("agent-simqueue-new", "phone", "com.apple.CoreSimulator.SimRuntime.iOS-26-5")
     assert seed.is_symlink() and (outside / "user-data").read_text() == "preserve"
+
+
+def test_install_timeout_preserves_stage_without_claiming_success(store, monkeypatch):
+    import plistlib
+
+    s, _, _, _ = store
+    app = s.t9 / "Uncertain.app"
+    app.mkdir()
+    (app / "Info.plist").write_bytes(
+        plistlib.dumps(
+            {
+                "CFBundleSupportedPlatforms": ["iPhoneSimulator"],
+                "CFBundleIdentifier": "com.example.uncertain",
+            }
+        )
+    )
+    backend = ImageBackend(s)
+
+    def incomplete(*args, **kwargs):
+        raise Attention("Install completion was not acknowledged")
+
+    monkeypatch.setattr(backend, "run", incomplete)
+    with pytest.raises(Attention, match="not acknowledged"):
+        backend.install("owned-uuid", str(app))
+    stages = list((s.mount / "Imports").glob("install-*/Uncertain.app"))
+    assert len(stages) == 1
+    assert (stages[0] / "Info.plist").read_bytes() == (app / "Info.plist").read_bytes()
+    assert app.exists()

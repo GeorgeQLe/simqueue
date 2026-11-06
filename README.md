@@ -18,33 +18,41 @@ The core queue works with the normal internal CoreSimulator device set. An optio
 APFS disk-image connection keeps disposable device data on external storage while
 leaving regular working simulators and shared runtime installations alone.
 
-**Status:** experimental macOS developer tooling, version 0.2.1. This repository
+**Status:** experimental macOS developer tooling, version 0.2.2. This repository
 contains the source and tests; local simulator data, disk images, screenshots,
 ownership journals and recovery credentials are not included.
 
-## Open issue: iOS 27 app installation
+## iOS 27 installation: mitigation and open issue
 
-**iOS 27 app execution from the external image is not fully verified.** On the tested
-iOS 27.0 runtime (24A5390f), boot and Contacts launch/screenshot succeeded after the
-Contacts workaround below. Installing an existing simulator app then exceeded the
-120-second native `simctl install` timeout. Subsequent CoreSimulator inventory calls
-also stopped responding. A graceful service restart restored responsiveness, and
-the disposable device was shut down, deleted and its image ejected.
+Version 0.2.2 allows up to **300 seconds** for native app installation, instead of
+120 seconds. Keep the MCP tool timeout at least 360 seconds. A timeout still means
+**outcome uncertain**: it does not prove installation failed, and simqueue never
+reports success just because a bundle exists. It preserves the import copy for
+inspection and does not automatically restart shared simulator services.
 
-The installation stall's root cause remains open. It has not been established that
-the runtime, the external image, or simqueue causes it. The Contacts startup crash
-and the app-installation timeout are distinct observations; fixing the former does
-not establish that the latter is fixed. No automatic service restart is performed.
+The original iOS 27.0 (24A5390f) timeout is intermittent. Investigation reproduced
+an installation timeout on a fresh **internal** device, so external storage is not
+a requirement for the failure. The original external-device MobileInstallation log
+recorded successful developer installation despite the caller timing out. A native
+stack sample from a later external run showed `simctl` waiting for the simulator's
+installation bridge to reply. Cold installation/LaunchServices work is a plausible
+contributor; the exact Apple-side cause remains **open**.
+
+Follow-up runs of the same simulator app completed on internal storage in 14.8
+seconds and on the T9-backed image in 54.4 seconds. Those runs support a bounded
+wait mitigation, but do not prove that increasing the timeout permanently resolves
+every stall. App installation, a live process and a visible app screen are separate
+checks. Separate Apple `AppIntentsLiveEntityService` assertion crashes were also
+observed and remain unresolved. See [the investigation notes](docs/ios27-investigation.md) for evidence and
+remaining limits. The separate fresh-device Contacts workaround is described below.
 
 | Tested runtime | External-image result |
 | --- | --- |
 | iOS 26.5 (23F77) | Boot, Contacts, app install/launch, screenshots, shared leases and final cleanup passed. |
-| iOS 27.0 (24A5390f) | Boot and Contacts passed; app installation timed out. Full app execution remains unverified. |
+| iOS 27.0 (24A5390f) | Full MCP install, live app process, visually reviewed game menu, Contacts, screenshots, shared leases, deletion and image eject passed in a follow-up run. Intermittent cold-start stalls remain open. |
 
-Until this is resolved, use the verified iOS 26.5 path for app tests on this host.
-The next investigation should compare the same app on fresh internal and external
-iOS 27 device sets and retain install/service diagnostics. These are host-specific
-observations, not a claim that every iOS 27 simulator installation fails.
+Use iOS 26.5 when reliable app testing matters more than investigating this iOS 27
+beta runtime. No automatic service restart or shared-runtime replacement is used.
 
 ## Agent workflow
 
@@ -152,7 +160,7 @@ app installation/launch, screenshot export, final deletion and normal image ejec
 It uses an existing Puzzle Quest simulator build and verifies regular devices are
 unchanged. The older `acceptance.py` uses an isolated internal test queue.
 
-## Contacts migration startup workaround (0.2.1)
+## Contacts migration startup workaround (0.2.2)
 
 On this host, fresh iOS 26.5 (23F77) and iOS 27.0 (24A5390f) devices with Apple's
 bundled sample Contacts data crash in `CNContactPosterMigrator performMigration`
