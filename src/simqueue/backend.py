@@ -4,6 +4,8 @@ import contextlib
 import contextvars
 import json
 import os
+import re
+import selectors
 import subprocess
 import time
 from pathlib import Path
@@ -13,11 +15,51 @@ class Attention(RuntimeError):
     """The outcome is uncertain; preserve the resource for reconciliation."""
 
 
+class BootFailure(Attention):
+    """Native boot monitoring reported a terminal migration failure."""
+
+
+class NativeTimeout(Attention):
+    """A native command exhausted its time budget."""
+
+
+BOOT_STATUS = re.compile(r"Status=([0-9]{1,3}),\s*isTerminal=(YES|NO)\b")
+
+
+def boot_statuses(output):
+    if isinstance(output, bytes):
+        output = output.decode(errors="replace")
+    return BOOT_STATUS.findall(output or "")
+
+
+def boot_detail(output):
+    text = output.decode(errors="replace")
+    matches = list(BOOT_STATUS.finditer(text))
+    if not matches:
+        return {}
+    last = matches[-1]
+    status = int(last[1])
+    detail = {"native_status": status, "terminal": last[2] == "YES"}
+    phase = {2: "data_migration", 3: "migration_failed", 4: "system_app"}.get(status)
+    if phase:
+        detail["native_phase"] = phase
+    if status == 2:
+        plugin = re.search(
+            r"^\s*Reason:Running plugin (com\.apple\.[\w.-]{1,120})(?=\s)",
+            text[last.end() :],
+            re.MULTILINE | re.ASCII,
+        )
+        if plugin:
+            detail["migration_plugin"] = plugin[1]
+    return detail
+
+
 class AppleBackend:
     operation_timeout = 120
 
     def __init__(self):
         self._deadline = contextvars.ContextVar("simqueue-native-deadline", default=None)
+        self._boot_observer = contextvars.ContextVar("simqueue-boot-observer", default=None)
         self.wrapper = Path.home() / ".local/bin/apple-tools"
         self.tool_command = (
             [str(self.wrapper), "xcrun"] if self.wrapper.exists() else ["/usr/bin/xcrun"]
@@ -25,37 +67,95 @@ class AppleBackend:
         self.device_root = Path.home() / "Library/Developer/CoreSimulator/Devices"
 
     @contextlib.contextmanager
-    def operation_budget(self):
+    def operation_budget(self, seconds=None):
         """Share a native-command budget across inventory, readiness and the operation."""
         previous = self._deadline.get()
-        deadline = time.monotonic() + self.operation_timeout
+        deadline = time.monotonic() + (self.operation_timeout if seconds is None else seconds)
         token = self._deadline.set(min(previous, deadline) if previous is not None else deadline)
         try:
             yield
         finally:
             self._deadline.reset(token)
 
+    @contextlib.contextmanager
+    def observe_boot(self, observer):
+        token = self._boot_observer.set(observer)
+        try:
+            yield
+        finally:
+            self._boot_observer.reset(token)
+
+    def monitor_bootstatus(self, command, timeout, env, observer):
+        """Stream only structured native progress, keeping the original command deadline."""
+        deadline = time.monotonic() + timeout
+        output = bytearray()
+        last = {}
+        with (
+            subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env
+            ) as process,
+            selectors.DefaultSelector() as selector,
+        ):
+            selector.register(process.stdout, selectors.EVENT_READ)
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise subprocess.TimeoutExpired(command, timeout, output=bytes(output))
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    detail = boot_detail(output)
+                    if detail and detail != last:
+                        observer({"command": "bootstatus", **detail})
+                        last = detail
+                code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except BaseException:
+                process.kill()
+                raise
+        return subprocess.CompletedProcess(command, code, output.decode(errors="replace"))
+
     def run(self, *args, timeout=45):
         deadline = self._deadline.get()
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise Attention("Native operation budget exhausted; outcome uncertain, reconcile")
+                raise NativeTimeout("Native operation budget exhausted; outcome uncertain")
             timeout = min(timeout, remaining)
         env = dict(os.environ)
         env.pop("SIMULATOR_DEVICE_SET_PATH", None)
+        command = [*self.tool_command, "simctl", "--set", str(self.device_root), *args]
+        observer = self._boot_observer.get()
+        if observer:
+            observer({"command": args[0]})
         try:
-            p = subprocess.run(
-                [*self.tool_command, "simctl", "--set", str(self.device_root), *args],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
+            p = (
+                self.monitor_bootstatus(command, timeout, env, observer)
+                if observer and args[0] == "bootstatus"
+                else subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
             )
         except subprocess.TimeoutExpired as exc:
-            raise Attention(
-                f"simctl {args[0]} exceeded {timeout:.1f}s; outcome uncertain, reconcile before retrying"
+            statuses = boot_statuses(exc.output) if args[0] == "bootstatus" else []
+            if ("3", "YES") in statuses:
+                raise BootFailure(
+                    "Native data migration failed; release this disposable device"
+                ) from exc
+            detail = f"; last native boot status {statuses[-1][0]}" if statuses else ""
+            recovery = (
+                "keep the lease for the coordinator's same-device readiness check"
+                if args[0] in ("boot", "bootstatus")
+                else "reconcile before retrying"
+            )
+            raise NativeTimeout(
+                f"simctl {args[0]} exceeded {timeout:.1f}s{detail}; outcome uncertain, {recovery}"
             ) from exc
         except OSError as exc:
             raise Attention("simctl could not start; inspect the local Apple toolchain") from exc
@@ -90,18 +190,28 @@ class AppleBackend:
             raise ValueError("Unknown device type identifier")
 
     def create(self, name, device_type, runtime):
-        return self.run("create", name, device_type, runtime).strip()
+        return self.run(
+            "create", name, device_type, runtime, timeout=self.operation_timeout
+        ).strip()
 
     def validate_created(self, uuid, runtime):
         """Backend-specific initialization proof for a journal-owned create intent."""
 
     def boot(self, uuid):
-        self.run("boot", uuid)
+        # Starting a cold device can itself outlast the generic command limit.
+        # Both phases still share Queue.boot's single operation deadline.
+        self.run("boot", uuid, timeout=self.operation_timeout)
         self.wait_ready(uuid)
 
     def wait_ready(self, uuid):
         """Require native terminal readiness even when inventory already says Booted."""
-        self.run("bootstatus", uuid, timeout=self.operation_timeout)
+        status = self.run("bootstatus", uuid, "-d", timeout=self.operation_timeout)
+        # simctl can exit zero for terminal data-migration failure (status 3).
+        # Do not echo native output, which can contain arbitrary device labels.
+        if ("3", "YES") in boot_statuses(status) or any(
+            line.strip() == "Data Migration Failed" for line in status.splitlines()
+        ):
+            raise BootFailure("Native data migration failed; release this disposable device")
         # Another holder may have shut the device down while bootstatus was waiting.
         if self.devices().get(uuid, {}).get("state") != "Booted":
             raise Attention("Device stopped during readiness check; native readiness unverified")
@@ -125,7 +235,17 @@ class Processes:
             raise ValueError("Invalid process ID")
         try:
             p = subprocess.run(
-                ["/bin/ps", "-p", str(pid), "-o", "lstart=", "-o", "uid=", "-o", "stat="],
+                [
+                    "/bin/ps",
+                    "-p",
+                    str(pid),
+                    "-o",
+                    "lstart=",
+                    "-o",
+                    "uid=",
+                    "-o",
+                    "stat=",
+                ],
                 check=False,
                 capture_output=True,
                 text=True,

@@ -27,6 +27,8 @@ def test_sdk_protocol(tmp_path, mode):
                 "inventory",
                 "capture",
                 "install",
+                "run_xctest",
+                "xctest_status",
             }
             invalid = await client.call_tool("release", {"lease_token": "invalid"})
             assert invalid.is_error
@@ -46,5 +48,12 @@ def test_sdk_protocol(tmp_path, mode):
             assert data["state"] == "granted"
             result = await client.call_tool("release", {"lease_token": data["lease_token"]})
             assert result.structured_content["device_state"] == "deleted"
+            compact = (await client.call_tool("status", {})).structured_content
+            assert compact["active_count"] == 0
+            assert compact["requests"] == []
+            assert "events" not in compact and "devices" not in compact
+            history = (await client.call_tool("status", {"history": True})).structured_content
+            assert history["requests"][0]["device_state"] == "deleted"
+            assert history["events"][-1]["event"] == "cleanup-verified"
 
     asyncio.run(check())

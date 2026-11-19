@@ -22,7 +22,9 @@ async def run(output, runtime, device_type, app_path, skip_contacts=False):
     installed_store = ImageStore.load(installed_root)
     if installed_store is None:
         raise RuntimeError("Configure the external storage image backend first")
-    installed_queue = Queue(installed_root, backend_for(installed_root))
+    installed_queue = Queue(
+        installed_root, backend_for(installed_root), max_devices=1, migrate_default_capacity=True
+    )
     # Fence normal allocations for the entire isolated-image acceptance run.
     with installed_queue.locked():
         if any(d["state"] != "deleted" for d in installed_queue.state["devices"].values()) or any(
@@ -72,6 +74,7 @@ async def run_isolated(output, runtime, device_type, app_path, storage_config, s
             Client(parameters, read_timeout_seconds=360) as a,
             Client(parameters, read_timeout_seconds=360) as b,
         ):
+            acquire_started = time.monotonic()
             lease = await call(
                 a,
                 "acquire",
@@ -81,6 +84,7 @@ async def run_isolated(output, runtime, device_type, app_path, storage_config, s
                 runtime=runtime,
                 share=True,
             )
+            report["create_and_verify_seconds"] = time.monotonic() - acquire_started
             leases.append(lease["lease_token"])
             atomic_json(capabilities, {"lease_tokens": leases, "uuid": lease["uuid"]})
             if lease["state"] != "granted":
@@ -103,7 +107,12 @@ async def run_isolated(output, runtime, device_type, app_path, storage_config, s
             assert joined["uuid"] == uid
             report["checks"].append("Independent MCP connections share one external-image device")
             print("Created external-image device; booting", uid, flush=True)
-            await call(a, "boot", lease_token=lease["lease_token"])
+            boot_started = time.monotonic()
+            try:
+                ready = await call(a, "boot", lease_token=lease["lease_token"])
+                assert ready["boot_ready"] is True
+            finally:
+                report["cold_boot_and_migration_seconds"] = time.monotonic() - boot_started
             print("Boot completed; verifying Contacts and installing Puzzle Quest", flush=True)
             device = Path(lease["device_set"]) / uid
             initialization_file = device / ".simqueue-initialization.json"

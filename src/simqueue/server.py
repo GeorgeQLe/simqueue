@@ -6,22 +6,28 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from .backend import Attention
+from .core import ROUTINE_RUNTIME
+from .xctest import XCTestRuns
 
 
 def invoke(operation, *args, **kwargs):
     try:
         return operation(*args, **kwargs)
-    except (Attention, ValueError) as exc:
+    except (Attention, OSError, ValueError) as exc:
         raise ToolError(str(exc)) from None
 
 
 def make_server(queue):
+    runs = XCTestRuns(queue)
     server = MCPServer(
         "simqueue",
         version="0.2.2",
         instructions=(
-            "Acquire an isolated simulator lease. Poll/heartbeat queued requests. "
+            "For built XCTest plans, submit run_xctest and keep its run ID for xctest_status. "
+            "The worker manages queueing, boot, test execution and cleanup even after the client disconnects. "
+            "Use iOS 26.5 for routine testing when available. For manual operations, acquire one isolated simulator lease and poll/heartbeat queued requests. "
             "Use its returned device_set with simctl --set and only its returned UUID. Share only by explicit sharing capability. "
+            "For Xcode 27 tests, append returned xcodebuild_args as individual arguments; the device-set environment variable alone is insufficient. "
             "Register test process PIDs before releasing. Release in finally, then verify cleanup. "
             "Allocation ready does not mean boot ready. Call boot and require success before app work. "
             "Keep capability tokens private; status never returns them."
@@ -35,11 +41,18 @@ def make_server(queue):
 
     @server.tool(structured_output=True)
     def acquire(
-        owner: str, task: str, device_type: str, runtime: str, ttl: int = 900, share: bool = False
+        owner: str,
+        task: str,
+        device_type: str,
+        runtime: str = ROUTINE_RUNTIME,
+        ttl: int = 900,
+        share: bool = False,
     ) -> dict[str, Any]:
         """Request a disposable device using exact installed identifiers. Returns a private
-        lease_token once; retain it. Capacity queues requests FIFO. Explicit share=True
-        also returns a private share_token for collaborators; sharing is never automatic."""
+        lease_token once; retain it. Requests queue FIFO for capacity to create a fresh
+        device. Use share=True to get a private share_token for a same-device handoff.
+        The incoming agent must join before the current holder releases. Omit runtime for iOS 26.5
+        when it is installed; otherwise select an exact installed identifier."""
         return invoke(queue.acquire, owner, task, device_type, runtime, ttl, share)
 
     @server.tool(structured_output=True)
@@ -59,7 +72,11 @@ def make_server(queue):
 
     @server.tool(structured_output=True)
     def boot(lease_token: str) -> dict[str, Any]:
-        """Boot the caller's allocated device and wait for boot completion."""
+        """Boot the caller's device; require boot_ready before tests.
+        Simqueue checks the same UUID once after a native timeout. Status and
+        heartbeat report the running operation. If readiness is still uncertain
+        or migration failed, inspect diagnostics and release the lease.
+        """
         return invoke(queue.boot, lease_token)
 
     @server.tool(structured_output=True)
@@ -71,7 +88,8 @@ def make_server(queue):
     @server.tool(structured_output=True)
     def release(lease_token: str) -> dict[str, Any]:
         """Idempotently release/cancel a request. Only the final holder permits cleanup.
-        Check device_state=deleted; attention means preservation requires follow-up."""
+        The final holder checks device_state=deleted. If another lease still holds
+        the device, it remains available. Attention means follow-up is required."""
         return invoke(queue.release, lease_token)
 
     @server.tool(structured_output=True)
@@ -88,9 +106,29 @@ def make_server(queue):
         return invoke(queue.capture, lease_token, filename)
 
     @server.tool(structured_output=True)
-    def status() -> dict[str, Any]:
-        """Read shared queue state, ownership and cleanup evidence without exposing tokens."""
-        return invoke(queue.status)
+    def run_xctest(
+        owner: str,
+        task: str,
+        device_type: str,
+        arguments: list[str],
+        runtime: str = ROUTINE_RUNTIME,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit a built .xctestrun plan. Pass absolute -xctestrun and -resultBundlePath,
+        with optional -only-testing selectors. A detached worker owns the lease.
+        Supply a client-generated 32-character lowercase hex run ID to safely retry
+        the same submission after losing its response."""
+        return invoke(runs.submit, owner, task, device_type, arguments, runtime, run_id)
+
+    @server.tool(structured_output=True)
+    def xctest_status(run_id: str) -> dict[str, Any]:
+        """Read progress, last native boot phase, test outcome and cleanup for one run."""
+        return invoke(runs.status, run_id)
+
+    @server.tool(structured_output=True)
+    def status(history: bool = False) -> dict[str, Any]:
+        """Read active queue state and attention. Set history for the full retained journal view."""
+        return invoke(queue.status, compact=not history)
 
     @server.tool(structured_output=True)
     def sweep() -> dict[str, Any]:

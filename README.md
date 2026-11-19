@@ -1,7 +1,8 @@
 # simqueue
 
 Host-local MCP coordination for disposable Apple simulators. Independent agent servers
-share a durable queue, with a default capacity of two devices. Each request gets an
+share a durable queue, with a default capacity of one device on the managed host.
+Isolated test queues can choose their own capacity. Each request gets an
 isolated device; collaborators can explicitly join a shared device using a private
 capability. The last release shuts down and deletes the device and verifies its UUID
 and device directory are gone.
@@ -56,24 +57,84 @@ beta runtime. No automatic service restart or shared-runtime replacement is used
 
 ## Agent workflow
 
-1. `inventory`: choose exact installed device-type and runtime identifiers.
+For a built XCTest plan, submit `run_xctest` once. Simqueue queues, renews, boots,
+runs stable Xcode on its own leased simulator, and verifies cleanup. Use
+`xctest_status` with the returned run ID to follow progress or reconnect from
+another client. Closing the submitting CLI or MCP connection leaves the worker
+running. For safe resubmission after a lost reply, supply a client-generated
+32-character lowercase hexadecimal `run_id` and reuse it with the same arguments.
+Choose a new run ID and result path for a new test attempt.
+
+The CLI takes the same inputs on JSON stdin:
+
+```sh
+simqueue call run-xctest <<'JSON'
+{
+  "owner": "agent",
+  "task": "campaign smoke",
+  "device_type": "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro",
+  "arguments": [
+    "-xctestrun", "/absolute/path/to/built/Tests.xctestrun",
+    "-resultBundlePath", "/absolute/path/on/T9/Smoke.xcresult",
+    "-only-testing:YourAppUITests/SmokeTests/testLaunch"
+  ]
+}
+JSON
+simqueue call xctest-status <<'JSON'
+{"run_id": "<returned run ID>"}
+JSON
+```
+
+Build before submitting. Give each run an unused result destination on verified
+external developer storage. Progress includes queue position, phase and elapsed
+time. During boot, the run records the current command and last observed native
+status for each attempt, including the Apple migration plugin when reported. On a
+boot failure, the run records the native log directory and reports `not_run`.
+Completed runs include the XCTest console log, result bundle when produced, and
+cleanup state. `cleanup: verified` means both the device UUID and device directory
+were verified gone. `cleanup: pending` can be checked again after coordinator
+reconciliation. The runner uses the existing boot budget and same-UUID recheck.
+
+The default `simqueue status` and MCP `status` show active queue entries and
+attention. For retained requests, devices and events, use
+`simqueue --history status` or MCP `status(history=true)`.
+
+### Manual leases
+
+1. `inventory`: choose an exact installed device type. Omit the runtime to use
+   iOS 26.5 when available, or supply the exact runtime needed for the test.
 2. `acquire(owner, task, device_type, runtime)`: retain the returned private
-   `lease_token`. A queued request has no device yet. Poll it; do not submit duplicates.
+   `lease_token`. A queued request waits for capacity to create its own device.
+   Poll the existing request. A normal queue entry cannot reserve another task's UUID.
 3. `heartbeat(lease_token)` before expiry (default 900 seconds). `boot` the granted
    device and target only its returned UUID in tests. Always pass its returned
    `device_set` to `simctl --set` (and `SIMULATOR_DEVICE_SET_PATH` for Xcode tests).
+   With Xcode 27, also append the returned `xcodebuild_args` to the command as
+   individual arguments. `SIMULATOR_DEVICE_SET_PATH` alone does not make Xcode
+   discover custom-set devices. The argument is
+   `"-DVTSimulatorSetLocation=<returned device_set>"` (one argument, including `=`).
+   Keep the destination fixed to the returned UUID. This is a per-process setting;
+   no global preference or default internal device-set redirect is needed.
+   For a built XCTest plan, use `simqueue call xcode-test` with the private
+   `lease_token` and an `arguments` array (for example, `["-xctestrun", "/path/to/Tests.xctestrun",
+   "-resultBundlePath", "/path/on/T9/Tests.xcresult"]`). Pass the JSON on stdin.
+   The command registers its PID, checks boot readiness, and runs stable Xcode
+   against the lease with parallel testing disabled. The caller releases the lease.
 4. `track_process(lease_token, pid)` for every build/test process that might outlive
    the task or its MCP server. Registration records PID plus start identity.
 5. In `finally`, wait for those processes, retain requested evidence on external developer storage, then
    `release(lease_token)`. A queued request is cancelled by the same operation.
-6. Confirm `device_state: deleted`. An `attention` result means preservation and
-   follow-up are required. `sweep` retries safe reconciliation; it never force-deletes.
+6. The final holder confirms `device_state: deleted`. With another holder still
+   granted, the released lease continues to show the shared device's current
+   state. An `attention` result means preservation and follow-up are required.
+   `sweep` retries safe reconciliation.
 
 Sharing requires `acquire(..., share=True)`, followed by each collaborator calling
 `join(share_token, owner, task)`. Each gets its own lease and must release it. Sharing
 permits simultaneous access; it does not serialize simulator UI or app mutations.
-Coordinate those separately. Unrelated tasks are never matched just because they ask
-for the same runtime.
+Coordinate those separately. For a same-device handoff, the incoming agent
+joins and confirms its own granted lease and the same UUID before the outgoing
+agent releases. The final holder is responsible for verified deletion.
 
 Tokens authorize operations. Keep them out of Git, reports and shell arguments.
 Status/events contain identifiers and labels but omit tokens and token hashes.
@@ -83,7 +144,14 @@ Expired/released token records are retained for seven days after device cleanup.
 
 - Only fresh devices named `agent-simqueue-<random-id>` with a persisted creation
   intent are managed. Existing working devices and shared runtimes are never adopted.
-- One file lock serializes all servers and CLI calls. State is private (0700 directory,
+- One file lock protects the shared ownership journal. Create, boot, install and capture
+  record a per-device operation and release the journal lock before waiting on
+  Apple tools. Status and heartbeats report the active operation. Release records
+  the request immediately and defers cleanup until the operation finishes.
+  An interrupted operation whose owner cannot be verified preserves its device.
+  A boot timeout triggers one short readiness check on the same UUID. If the
+  check cannot establish readiness, inspect its CoreSimulator logs and release.
+  State is private (0700 directory,
   0600 files), fsynced and atomically replaced. Device identity is checked before use
   and deletion; shutdown is verified before deletion.
 - A creation timeout reserves capacity. An exact unique name/type/runtime match can
@@ -95,7 +163,7 @@ Expired/released token records are retained for seven days after device cleanup.
 - The owner is the MCP server process, or the short-lived CLI process for CLI calls.
   A shared long-lived server cannot prove an individual task has ended. Tasks must
   release explicitly; TTL alone is not permission to delete a live owner's device.
-- Every mutation/poll/sweep reconciles work. The installed user LaunchAgent also
+- Poll and sweep reconcile work. Heartbeat renews active leases without native probes. The installed user LaunchAgent also
   sweeps once a minute, allowing cleanup after all MCP servers disconnect. `status`
   itself is read-only. There is no persistent daemon beyond active MCP connections.
 - This is a cooperative local coordinator. It cannot protect a process or agent that
@@ -262,6 +330,11 @@ boot readiness. A successful `boot` now returns `boot_ready: true`, rechecks
 has not stopped during the wait. `install` and `capture` each check native
 readiness again before doing app or framebuffer work. A timeout remains uncertain;
 never substitute polling, a service PID or `Booted` inventory for successful boot.
+On a timeout, status reports `boot_error` and the journal records how long the
+operation ran. The error includes the last numeric native boot status when
+available, without retaining raw command output. A device already in `Booting`
+is monitored on its existing UUID.
+
 Readiness also does not establish that an app's assets have finished rendering.
 The native acceptance runner allows 180 seconds for app launch: a cold 16e/iOS
 26.3.1 launch on the 8 GB T7 host completed in 95.8 seconds. It still requires a
@@ -272,6 +345,27 @@ Inventory, readiness and subsequent native commands share one operation deadline
 staging and storage checks consume elapsed time rather than starting a fresh
 native wait window. These are native-command limits, not hard interruption of
 filesystem I/O; retain client transport overhead as described above.
+
+Native device startup uses this same budget, including `simctl boot` itself;
+it no longer has a separate 45-second cutoff. If boot times out, keep the lease
+while the coordinator performs one additional readiness check on the same device,
+with a 30-second budget. If that check also times out, collect diagnostics for
+the UUID, release the lease, and verify deletion. A fresh device restarts cold
+migration. Start tests only after receiving `boot_ready: true`.
+
+`simctl bootstatus` can also exit zero while reporting terminal status 3, “Data
+Migration Failed.” Simqueue rejects this result and records the failure in its
+device journal. Later boot/install/capture calls cannot bypass it through an
+“already booted” response. Retain diagnostics, then release that failed disposable
+device. This terminal failure differs from a timeout while migration is progressing.
+
+Device creation reserves a journal entry before calling CoreSimulator. Status
+and heartbeats can run while the create operation is in progress. The create
+command shares the backend operation budget with inventory and verification.
+After a timeout, use the original lease capability to poll for the device.
+CoreSimulator can publish it minutes after the client has timed out. The queue
+reconciles the exact generated name, device type and runtime before allocating
+another device. A missing device in inventory leaves the intent unresolved.
 
 Recovery of an interrupted image-device create must verify the affected runtime's
 Contacts initialization marker and preserved seed before granting its lease. A

@@ -17,7 +17,7 @@ class Backend:
         self.fail_delete = False
         self.fail_inventory = False
 
-    def operation_budget(self):
+    def operation_budget(self, seconds=None):
         return contextlib.nullcontext()
 
     def validate_created(self, uid, runtime):
@@ -238,6 +238,25 @@ def test_symlink_and_capacity_mismatch(setup, tmp_path):
         Queue(link, b, p).status(sweep=True)
     assert len(b.items) == 1
     q.release(a["lease_token"])
+
+
+def test_default_capacity_waits_for_legacy_lease_cleanup(tmp_path):
+    backend, processes = Backend(), Processes()
+    old = Queue(tmp_path / "state", backend, processes, max_devices=2)
+    lease = acquire(old)
+    path = old.root / "state.json"
+    state = json.loads(path.read_text())
+    state["version"] = 1
+    path.write_text(json.dumps(state))
+    new = Queue(old.root, backend, processes, max_devices=1, migrate_default_capacity=True)
+    assert new.status()["capacity"] == 2
+    assert new.status(sweep=True)["capacity"] == 2
+    assert json.loads(path.read_text())["version"] == 1
+    with pytest.raises(Attention, match="Previous simqueue clients"):
+        acquire(new)
+    assert old.release(lease["lease_token"])["device_state"] == "deleted"
+    assert new.status(sweep=True)["capacity"] == 1
+    assert json.loads(path.read_text())["version"] == 2
 
 
 def test_create_uuid_known_but_inventory_uncertain(setup):

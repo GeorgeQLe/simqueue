@@ -1,4 +1,4 @@
-"""Durable host-local queue. Every operation is serialized across MCP/CLI processes."""
+"""Durable host-local queue with serialized ownership and per-device operations."""
 
 import contextlib
 import fcntl
@@ -12,7 +12,13 @@ import time
 import uuid
 from pathlib import Path
 
-from .backend import Attention, Processes
+from .backend import Attention, BootFailure, NativeTimeout, Processes
+
+ROUTINE_RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-26-5"
+
+
+class BootReadinessUncertain(Attention):
+    """The bounded same-device recheck could not establish readiness."""
 
 
 def require(condition):
@@ -31,7 +37,15 @@ def label(value):
 
 
 class Queue:
-    def __init__(self, root, backend, processes=None, clock=time.time, max_devices=2):
+    def __init__(
+        self,
+        root,
+        backend,
+        processes=None,
+        clock=time.time,
+        max_devices=2,
+        migrate_default_capacity=False,
+    ):
         self.root = Path(root).absolute()
         self.backend = backend
         self.processes = processes or Processes()
@@ -39,10 +53,11 @@ class Queue:
         if type(max_devices) is not int or not 1 <= max_devices <= 8:
             raise ValueError("Capacity must be 1..8")
         self.capacity = max_devices
+        self.migrate_default_capacity = migrate_default_capacity
         self.state = None
 
     @contextlib.contextmanager
-    def locked(self):
+    def locked(self, read_only=False, legacy_sweep=False):
         if self.root.is_symlink():
             raise Attention("State directory must not be a symlink")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -50,7 +65,9 @@ class Queue:
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
             raise Attention("State directory must be owned by this user with mode 0700")
         lock = os.open(
-            self.root / "coordinator.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+            self.root / "coordinator.lock",
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+            0o600,
         )
         try:
             end = time.monotonic() + 8
@@ -65,22 +82,56 @@ class Queue:
             path = self.root / "state.json"
             if path.is_symlink():
                 raise Attention("State file must not be a symlink")
+            migrate = False
             if path.exists():
                 try:
                     self.state = json.loads(path.read_text())
-                    require(self.state["version"] == 1)
-                    require(self.state["capacity"] == self.capacity)
+                    require(self.state["version"] in (1, 2))
                     require(isinstance(self.state["devices"], dict))
                     require(isinstance(self.state["requests"], dict))
                     require(isinstance(self.state["events"], list))
                     self.validate_state()
+                    migrate = self.state["version"] == 1
+                    legacy_live = (
+                        migrate
+                        and self.migrate_default_capacity
+                        and (
+                            any(d["state"] != "deleted" for d in self.state["devices"].values())
+                            or any(
+                                r["state"] not in ("released", "expired")
+                                for r in self.state["requests"].values()
+                            )
+                        )
+                    )
+                    if legacy_live:
+                        if not read_only and not legacy_sweep:
+                            raise Attention(
+                                "Previous simqueue clients are still active; wait for their verified cleanup"
+                            )
+                        migrate = False
+                    if self.state["capacity"] != self.capacity:
+                        require(
+                            self.migrate_default_capacity
+                            and self.state["capacity"] == 2
+                            and self.capacity == 1
+                        )
+                        if (
+                            not read_only
+                            and all(d["state"] == "deleted" for d in self.state["devices"].values())
+                            and all(
+                                r["state"] in ("released", "expired")
+                                for r in self.state["requests"].values()
+                            )
+                        ):
+                            self.state["capacity"] = self.capacity
+                            migrate = True
                 except (ValueError, KeyError, AssertionError, TypeError) as exc:
                     raise Attention(
                         "Invalid state or capacity mismatch; nothing was overwritten"
                     ) from exc
             else:
                 self.state = {
-                    "version": 1,
+                    "version": 2,
                     "capacity": self.capacity,
                     "devices": {},
                     "requests": {},
@@ -100,6 +151,9 @@ class Queue:
                 )
             self.state["backend_key"] = namespace
             self.prune()
+            if migrate and not read_only:
+                self.state["version"] = 2
+                self.save()
             yield
         finally:
             self.state = None
@@ -112,6 +166,20 @@ class Queue:
             require(d["name"] == "agent-simqueue-" + did)
             require(d["state"] in ("creating", "ready", "deleting", "deleted"))
             require(d["request_id"] in self.state["requests"])
+            require(type(d.get("boot_failure", False)) is bool)
+            require(type(d.get("boot_timeout", False)) is bool)
+            if (operation := d.get("operation")) is not None:
+                require(self.state["version"] == 2)
+                require(
+                    (operation["kind"] == "create" and d["state"] == "creating")
+                    or (
+                        operation["kind"] in ("boot", "install", "capture")
+                        and d["state"] == "ready"
+                    )
+                )
+                require(type(operation["pid"]) is int and operation["pid"] > 0)
+                require(isinstance(operation["stamp"], str) and bool(operation["stamp"]))
+                require(type(operation["started"]) in (float, int))
             if d["uuid"] is not None:
                 uuid.UUID(d["uuid"])
         for rid, r in self.state["requests"].items():
@@ -127,13 +195,14 @@ class Queue:
 
     def maintain_safely(self, inspect_active=True):
         try:
-            self.maintenance(inspect_active=inspect_active)
+            intent = self.maintenance(inspect_active=inspect_active)
         except Attention as exc:
             self.state["attention"] = str(exc)
             self.save()
         else:
             self.state.pop("attention", None)
             self.save()
+            return intent
 
     def prune(self):
         cutoff = self.clock() - 7 * 86400
@@ -189,7 +258,9 @@ class Queue:
                 return request
         raise ValueError("Unknown lease capability")
 
-    def new_request(self, owner, task, ttl, device_type, runtime, share_hash=None, device_id=None):
+    def new_request(
+        self, owner, task, ttl, device_type, runtime, share_hash=None, device_id=None, run_id=None
+    ):
         if type(ttl) is not int or not 60 <= ttl <= 86400:
             raise ValueError("TTL must be 60..86400 seconds")
         owner, task = label(owner), label(task)
@@ -216,6 +287,8 @@ class Queue:
             "device_id": device_id,
             "sequence": self.state.get("sequence", 0) + 1,
         }
+        if run_id is not None:
+            r["run_id"] = run_id
         self.state["sequence"] = r["sequence"]
         self.state["requests"][rid] = r
         self.save({"event": "requested", "request_id": rid})
@@ -223,6 +296,7 @@ class Queue:
 
     def public(self, r):
         d = self.state["devices"].get(r["device_id"], {})
+        device_set = str(self.backend.device_root) if hasattr(self.backend, "device_root") else None
         held = r["state"] == "granted" and r["expires"] <= self.clock()
         queued = [q for q in self.state["requests"].values() if q["state"] == "queued"]
         queued.sort(key=lambda q: q["sequence"])
@@ -233,17 +307,25 @@ class Queue:
             "task": r["task"],
             "expires": r["expires"],
             "uuid": d.get("uuid"),
-            "device_set": str(self.backend.device_root)
-            if hasattr(self.backend, "device_root")
-            else None,
+            "device_set": device_set,
+            "xcodebuild_args": [f"-DVTSimulatorSetLocation={device_set}"] if device_set else [],
             "device_state": d.get("state"),
             "device_type": r["device_type"],
             "runtime": r["runtime"],
             "attention": d.get("attention") or self.state.get("attention"),
+            "operation": self.public_operation(d),
+            "boot_error": d.get("boot_error"),
+            **({"run_id": r["run_id"]} if "run_id" in r else {}),
             "queue_position": next(
                 (i + 1 for i, q in enumerate(queued) if q["id"] == r["id"]), None
             ),
         }
+
+    def public_operation(self, device):
+        operation = device.get("operation")
+        if operation is None:
+            return None
+        return {"kind": operation["kind"], "started": operation["started"]}
 
     def holders(self, device_id):
         return [
@@ -282,15 +364,28 @@ class Queue:
             return
         live = [(did, d) for did, d in self.state["devices"].items() if d["state"] != "deleted"]
         pending = any(r["state"] == "queued" for r in self.state["requests"].values())
+        running = [(did, d) for did, d in live if d.get("operation")]
+        if running:
+            # A slow native command can also stall inventory for the whole device set.
+            owners = [self.inspect_operation(did, device) for did, device in running]
+            if any(owners):
+                return
+            for did, d in running:
+                if d["operation"]["kind"] == "create":
+                    # The producer died. Reconcile its original identity from inventory.
+                    d.pop("operation")
+                    self.save({"event": "create-owner-gone", "device_id": did})
         if (
             not inspect_active
             and all(d["state"] == "ready" and self.holders(did) for did, d in live)
-            and not (pending and len(live) < self.capacity)
+            and not (pending and len(live) < self.state["capacity"])
         ):
             return
-        devices = self.backend.devices()
+        devices = self.backend.devices() if live else {}
         for did, d in self.state["devices"].items():
             if d["state"] == "deleted":
+                continue
+            if d.get("operation"):
                 continue
             try:
                 if not d.get("uuid"):
@@ -307,7 +402,9 @@ class Queue:
                     # Identifying a UUID does not prove post-create initialization finished.
                     self.save({"event": "create-identified", "device_id": did})
                 actual = self.checked_device(d, devices)
-                if d["state"] == "creating" and actual is not None:
+                if d["state"] == "creating":
+                    if actual is None:
+                        raise Attention("Created UUID is not yet visible; reconcile the intent")
                     request = self.state["requests"][d["request_id"]]
                     if request["state"] == "creating":
                         self.backend.validate_created(d["uuid"], d["runtime"])
@@ -346,6 +443,11 @@ class Queue:
             except Attention as exc:
                 d["attention"] = str(exc)
                 self.save({"event": "attention", "device_id": did})
+        # A v1 client can still be using this journal during legacy cleanup.
+        if self.state["version"] == 1 or any(
+            d["state"] == "creating" for d in self.state["devices"].values()
+        ):
+            return
         queued = sorted(
             (r for r in self.state["requests"].values() if r["state"] == "queued"),
             key=lambda r: r["sequence"],
@@ -353,7 +455,7 @@ class Queue:
         for r in queued:
             if (
                 sum(d["state"] != "deleted" for d in self.state["devices"].values())
-                >= self.capacity
+                >= self.state["capacity"]
             ):
                 break
             alive = self.processes.alive(r["owner_pid"], r["owner_stamp"])
@@ -363,6 +465,10 @@ class Queue:
                 r["state"] = "expired"
                 self.save()
                 continue
+            pid = os.getpid()
+            stamp = self.processes.fingerprint(pid)
+            if stamp is None:
+                raise Attention("Cannot identify this create operation owner")
             did = uuid.uuid4().hex
             d = {
                 "id": did,
@@ -373,35 +479,108 @@ class Queue:
                 "device_type": r["device_type"],
                 "runtime": r["runtime"],
                 "share_hash": r["share_hash"],
+                "operation": {
+                    "kind": "create",
+                    "pid": pid,
+                    "stamp": stamp,
+                    "started": now,
+                },
             }
             self.state["devices"][did] = d
             r["device_id"] = did
             r["state"] = "creating"
             self.save({"event": "create-intent", "device_id": did})
-            try:
-                self.backend.validate(r["device_type"], r["runtime"])
-                created = self.backend.create(d["name"], d["device_type"], d["runtime"])
-                uuid.UUID(created)
-                d["uuid"] = created
-                if self.checked_device(d, self.backend.devices()) is None:
-                    raise Attention("Created device is not yet visible; reconcile the intent")
-                self.backend.validate_created(created, d["runtime"])
-                r["state"] = "granted"
-                d["state"] = "ready"
-                self.save({"event": "granted", "request_id": r["id"], "device_id": did})
-            except (Attention, ValueError) as exc:
-                d["attention"] = str(exc)
-                self.save({"event": "create-uncertain", "device_id": did})
+            return d.copy()
 
-    def acquire(self, owner, task, device_type, runtime, ttl=900, share=False):
+    def create_reserved(self, intent):
+        if intent is None:
+            return
+        did = intent["id"]
+        created = None
+        error = None
+        try:
+            with self.backend.operation_budget():
+                result = self.backend.create(
+                    intent["name"], intent["device_type"], intent["runtime"]
+                )
+                uuid.UUID(result)
+                created = result
+                intent["uuid"] = created
+                if self.checked_device(intent, self.backend.devices()) is None:
+                    raise Attention("Created device is not yet visible; reconcile the intent")
+                self.backend.validate_created(created, intent["runtime"])
+        except (Attention, ValueError) as exc:
+            error = str(exc)
         with self.locked():
-            self.backend.validate(device_type, runtime)
-            shared = secrets.token_urlsafe(32) if share else None
-            r, token = self.new_request(
-                owner, task, ttl, device_type, runtime, token_hash(shared) if shared else None
+            device = self.state["devices"][did]
+            require(device["operation"] == intent["operation"])
+            request = self.state["requests"][device["request_id"]]
+            device.pop("operation")
+            device["uuid"] = created
+            if error is not None:
+                device["attention"] = error
+                self.save({"event": "create-uncertain", "device_id": did})
+            elif request["state"] == "creating":
+                request["state"] = "granted"
+                device["state"] = "ready"
+                self.save({"event": "granted", "request_id": request["id"], "device_id": did})
+            else:
+                self.save({"event": "create-finished-after-release", "device_id": did})
+
+    def inspect_operation(self, device_id, device):
+        operation = device.get("operation")
+        if operation is None:
+            return
+        try:
+            alive = self.processes.alive(operation["pid"], operation["stamp"])
+        except Attention:
+            alive = None
+        if alive is not True:
+            message = (
+                "Native operation owner is gone or unverifiable; device retained for inspection"
             )
-            self.maintain_safely()
-            return {**self.public(r), "lease_token": token, "share_token": shared}
+            if device.get("attention") != message:
+                device["attention"] = message
+                self.save({"event": "operation-uncertain", "device_id": device_id})
+        return alive is not False
+
+    def acquire(
+        self,
+        owner,
+        task,
+        device_type,
+        runtime=ROUTINE_RUNTIME,
+        ttl=900,
+        share=False,
+        *,
+        run_id=None,
+        on_request=None,
+    ):
+        # Validation can call simctl as well. Keep it outside the journal lock.
+        if on_request is not None and not callable(on_request):
+            raise ValueError("Invalid request observer")
+        self.backend.validate(device_type, runtime)
+        with self.locked():
+            shared = secrets.token_urlsafe(32) if share else None
+            request, token = self.new_request(
+                owner,
+                task,
+                ttl,
+                device_type,
+                runtime,
+                token_hash(shared) if shared else None,
+                run_id=run_id,
+            )
+            if on_request is not None:
+                on_request(request["id"], token)
+            intent = self.maintain_safely(inspect_active=False)
+        self.create_reserved(intent)
+        with self.locked(read_only=True):
+            return {
+                **self.public(self.request(token)),
+                "lease_token": token,
+                "share_token": shared,
+            }
 
     def join(self, share_token, owner, task, ttl=900):
         with self.locked():
@@ -416,6 +595,8 @@ class Queue:
             )
             if d is None or not any(r["expires"] > self.clock() for r in self.holders(d["id"])):
                 raise ValueError("Unknown or inactive sharing capability")
+            if any(device.get("operation") for device in self.state["devices"].values()):
+                raise Attention("A native operation is in progress; join after it completes")
             if self.checked_device(d, self.backend.devices()) is None:
                 raise Attention("Shared device is missing")
             r, token = self.new_request(
@@ -430,16 +611,22 @@ class Queue:
             if renew and r["state"] in ("queued", "granted", "creating"):
                 r["expires"] = self.clock() + r["ttl"]
                 self.save()
-            self.maintain_safely()
-            return self.public(r)
+                if r["state"] == "granted":
+                    return self.public(r)
+            intent = self.maintain_safely(inspect_active=False)
+        self.create_reserved(intent)
+        with self.locked(read_only=True):
+            return self.public(self.request(token))
 
     def release(self, token):
         with self.locked():
             r = self.request(token)
             r["state"] = "released"
             self.save({"event": "released", "request_id": r["id"]})
-            self.maintain_safely()
-            return self.public(r)
+            intent = self.maintain_safely(inspect_active=False)
+        self.create_reserved(intent)
+        with self.locked(read_only=True):
+            return self.public(self.request(token))
 
     def track_process(self, token, pid):
         with self.locked():
@@ -455,64 +642,191 @@ class Queue:
                 self.save({"event": "process-tracked", "request_id": r["id"]})
             return {"tracked": True, "pid": pid}
 
-    def boot(self, token):
-        with self.locked(), self.backend.operation_budget():
-            r = self.request(token)
-            if r["state"] != "granted":
+    @contextlib.contextmanager
+    def device_operation(self, token, kind):
+        with self.locked():
+            request = self.request(token)
+            if request["state"] != "granted":
                 raise ValueError("An active lease is required")
-            d = self.state["devices"][r["device_id"]]
-            a = self.checked_device(d, self.backend.devices())
-            if a is None:
-                raise Attention("Managed device is missing")
-            if a["state"] == "Shutdown":
-                self.backend.boot(d["uuid"])
-            elif a["state"] == "Booted":
-                self.backend.wait_ready(d["uuid"])
-            else:
-                raise Attention("Managed device is transitioning; native readiness unverified")
-            return {**self.public(r), "boot_ready": True}
+            device = self.state["devices"][request["device_id"]]
+            if device.get("operation"):
+                raise Attention(
+                    "Device operation already in progress or unresolved; check lease status"
+                )
+            if device.get("boot_failure"):
+                raise BootFailure("Native data migration failed; release this disposable device")
+            if device.get("boot_timeout"):
+                raise Attention(
+                    "Boot readiness remains uncertain after a recheck; inspect logs and release"
+                )
+            pid = os.getpid()
+            stamp = self.processes.fingerprint(pid)
+            if stamp is None:
+                raise Attention("Cannot identify this native operation owner")
+            operation = {
+                "kind": kind,
+                "pid": pid,
+                "stamp": stamp,
+                "started": self.clock(),
+            }
+            device["operation"] = operation
+            device_id, request_id = device["id"], request["id"]
+            self.save({"event": "operation-started", "device_id": device_id, "kind": kind})
+
+        event = "operation-finished"
+        boot_error = None
+        try:
+            yield device, request_id
+        except BootFailure as exc:
+            event = "boot-failed"
+            boot_error = str(exc)
+            raise
+        except BootReadinessUncertain as exc:
+            event = "boot-recheck-failed"
+            boot_error = str(exc)
+            raise
+        except Exception:
+            event = "operation-error"
+            raise
+        finally:
+            with self.locked():
+                current = self.state["devices"][device_id]
+                require(current["operation"] == operation)
+                current.pop("operation")
+                if event == "boot-failed":
+                    current["boot_failure"] = True
+                if event == "boot-recheck-failed":
+                    current["boot_timeout"] = True
+                entry = {
+                    "event": event,
+                    "device_id": device_id,
+                    "kind": kind,
+                    "elapsed_seconds": round(max(0, self.clock() - operation["started"]), 1),
+                }
+                if boot_error is not None:
+                    current["boot_error"] = boot_error
+                    entry["boot_error"] = boot_error
+                self.save(entry)
+
+    def boot(self, token, progress=None):
+        observe = self.backend.observe_boot(progress) if progress else contextlib.nullcontext()
+        with self.device_operation(token, "boot") as (device, request_id), observe:
+            try:
+                with self.backend.operation_budget():
+                    actual = self.checked_device(device, self.backend.devices())
+                    if actual is None:
+                        raise Attention("Managed device is missing")
+                    if actual["state"] == "Shutdown":
+                        self.backend.boot(device["uuid"])
+                    elif actual["state"] in ("Booting", "Booted"):
+                        self.backend.wait_ready(device["uuid"])
+                    else:
+                        raise Attention(
+                            "Managed device is transitioning; native readiness unverified"
+                        )
+            except NativeTimeout as initial:
+                if progress:
+                    progress({"attempt": "recheck"})
+                try:
+                    with self.backend.operation_budget(seconds=30):
+                        actual = self.checked_device(device, self.backend.devices())
+                        if actual is None or actual["state"] not in (
+                            "Booted",
+                            "Booting",
+                        ):
+                            raise Attention("Managed device is not booting or booted")
+                        self.backend.wait_ready(device["uuid"])
+                except BootFailure:
+                    raise
+                except Attention as exc:
+                    raise BootReadinessUncertain(
+                        f"Boot readiness remains uncertain after one recheck. Initial wait: {initial}. "
+                        f"Recheck: {exc}. Inspect CoreSimulator logs for this UUID and release the lease."
+                    ) from exc
+        with self.locked():
+            request = self.state["requests"][request_id]
+            return {**self.public(request), "boot_ready": request["state"] == "granted"}
+
+    def booted_operation(self, token, kind, argument):
+        with (
+            self.device_operation(token, kind) as (device, request_id),
+            self.backend.operation_budget(),
+        ):
+            operation = getattr(self.backend, kind, None)
+            if operation is None:
+                raise Attention(f"Managed {kind} requires the external storage image backend")
+            actual = self.checked_device(device, self.backend.devices())
+            if actual is None or actual["state"] != "Booted":
+                raise Attention(f"Managed device must be booted for {kind}")
+            self.backend.wait_ready(device["uuid"])
+            if kind == "capture":
+                return operation(device["uuid"], request_id, argument)
+            return operation(device["uuid"], argument)
 
     def install(self, token, app_path):
-        with self.locked(), self.backend.operation_budget():
-            r = self.request(token)
-            if r["state"] != "granted":
-                raise ValueError("An active lease is required")
-            if not hasattr(self.backend, "install"):
-                raise Attention("Managed install requires the external storage image backend")
-            d = self.state["devices"][r["device_id"]]
-            actual = self.checked_device(d, self.backend.devices())
-            if actual is None or actual["state"] != "Booted":
-                raise Attention("Managed device must be booted for install")
-            self.backend.wait_ready(d["uuid"])
-            return self.backend.install(d["uuid"], app_path)
+        return self.booted_operation(token, "install", app_path)
 
     def capture(self, token, filename="screenshot.png"):
-        with self.locked(), self.backend.operation_budget():
-            r = self.request(token)
-            if r["state"] != "granted":
-                raise ValueError("An active lease is required")
-            if not hasattr(self.backend, "capture"):
-                raise Attention("Managed capture requires the external storage image backend")
-            d = self.state["devices"][r["device_id"]]
-            actual = self.checked_device(d, self.backend.devices())
-            if actual is None or actual["state"] != "Booted":
-                raise Attention("Managed device must be booted for capture")
-            self.backend.wait_ready(d["uuid"])
-            return self.backend.capture(d["uuid"], r["id"], filename)
+        return self.booted_operation(token, "capture", filename)
 
-    def status(self, sweep=False):
-        with self.locked():
-            if sweep:
-                self.maintain_safely(inspect_active=False)
-            return {
-                "capacity": self.capacity,
+    def request_status(self, request_id):
+        with self.locked(read_only=True):
+            request = self.state["requests"].get(request_id)
+            return self.public(request) if request is not None else None
+
+    def status(self, sweep=False, compact=False):
+        if sweep:
+            with self.locked(legacy_sweep=True):
+                intent = self.maintain_safely(inspect_active=False)
+            self.create_reserved(intent)
+        with self.locked(read_only=True):
+            summary = {
+                "capacity": self.state["capacity"],
                 "storage": self.backend.store.status()
                 if hasattr(self.backend, "store")
                 else {"mode": "internal"},
                 "attention": self.state.get("attention"),
+            }
+            if compact:
+                active = sorted(
+                    (
+                        r
+                        for r in self.state["requests"].values()
+                        if r["state"] in ("queued", "creating", "granted")
+                    ),
+                    key=lambda r: r["sequence"],
+                )
+                devices = self.state["devices"].values()
+                return {
+                    **summary,
+                    "active_count": len(active),
+                    "queued_count": sum(r["state"] == "queued" for r in active),
+                    "requests": [
+                        {
+                            **{
+                                key: value
+                                for key, value in self.public(r).items()
+                                if key not in {"device_set", "xcodebuild_args", "expires"}
+                                and value is not None
+                            },
+                            "elapsed_seconds": round(max(0, self.clock() - r["created"]), 1),
+                        }
+                        for r in active[:20]
+                    ],
+                    "device_attention": [
+                        {"uuid": d.get("uuid"), "attention": d["attention"]}
+                        for d in devices
+                        if d.get("attention") and d["state"] != "deleted"
+                    ],
+                }
+            return {
+                **summary,
                 "requests": [self.public(r) for r in self.state["requests"].values()],
                 "devices": [
-                    {k: v for k, v in d.items() if k != "share_hash"}
+                    {
+                        **{k: v for k, v in d.items() if k not in ("share_hash", "operation")},
+                        "operation": self.public_operation(d),
+                    }
                     for d in self.state["devices"].values()
                 ],
                 "events": self.state["events"][-20:],
