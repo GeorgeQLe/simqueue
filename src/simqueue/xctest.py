@@ -21,6 +21,8 @@ TRACKED_EXEC = (
     "sys.stdin.buffer.read(1) == b'1' or sys.exit(1); "
     "os.execv(sys.argv[1], sys.argv[1:])"
 )
+MAX_WAIT_SECONDS = 900
+MCP_WAIT_SECONDS = 45
 
 
 def xcode_options(arguments):
@@ -154,6 +156,7 @@ class XCTestRuns:
                         "phase_started_at": now,
                     },
                 )
+                self.queue.observe("enqueue", run_id=run_id, reason="preparing")
             # The worker claims the record under the same lock. Resubmitting a
             # lost acknowledgement cannot give two workers a lease for this ID.
             command = [sys.executable, "-m", "simqueue.cli", "--state-dir", str(self.queue.root)]
@@ -212,6 +215,24 @@ class XCTestRuns:
                     result["cleanup"] = "pending"
         return result
 
+    def wait(self, run_id, timeout_seconds=MCP_WAIT_SECONDS):
+        """Wait on the run journal without owning the worker or its lease."""
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_WAIT_SECONDS:
+            raise ValueError(f"XCTest wait must be between 1 and {MAX_WAIT_SECONDS} seconds")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            status = self.status(run_id)
+            phase = status["phase"]
+            if phase == "finished":
+                ready = status.get("cleanup") in {"verified", "no_device"}
+                return {"wait_result": "finished" if ready else "attention", **status}
+            if phase == "interrupted" or (phase == "submitted" and status.get("attention")):
+                return {"wait_result": "attention", **status}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"wait_result": "timeout", "run_id": run_id, "phase": phase}
+            time.sleep(min(2, remaining))
+
     def work(self, run_id):
         with self.queue.locked(read_only=True):
             record = self.read(run_id)
@@ -233,7 +254,25 @@ class XCTestRuns:
 
         token = None
         stopping = threading.Event()
+        sampling_stopped = threading.Event()
         heartbeat = None
+
+        def sample():
+            peer = Queue(
+                self.queue.root,
+                self.queue.backend,
+                max_devices=self.queue.capacity,
+                migrate_default_capacity=self.queue.migrate_default_capacity,
+            )
+            while not sampling_stopped.wait(30):
+                try:
+                    with peer.locked(read_only=True):
+                        peer.observe("sample", run_id=run_id)
+                except (Attention, OSError):
+                    continue
+
+        if self.queue.migrate_default_capacity:
+            threading.Thread(target=sample, daemon=True).start()
 
         def requested(request_id, capability):
             nonlocal token
@@ -377,4 +416,18 @@ class XCTestRuns:
                     update(cleanup_attention=str(exc))
             if "outcome" not in record:
                 update(outcome="interrupted")
-            update(phase="finished", cleanup=cleanup, finished_at=time.time())
+            sampling_stopped.set()
+            finished = time.time()
+            update(phase="finished", cleanup=cleanup, finished_at=finished)
+            if self.queue.migrate_default_capacity:
+                try:
+                    with self.queue.locked(read_only=True):
+                        self.queue.observe(
+                            "finish",
+                            run_id=run_id,
+                            outcome=record["outcome"],
+                            cleanup=cleanup,
+                            run_ms=max(0, round((finished - record["submitted_at"]) * 1000)),
+                        )
+                except (Attention, OSError):
+                    pass

@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 
 from .backend import Attention, BootFailure, NativeTimeout, Processes
+from .resource_log import observe
 
 ROUTINE_RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-26-5"
 
@@ -248,6 +249,41 @@ class Queue:
         finally:
             if os.path.exists(name):
                 os.unlink(name)
+
+        if event and self.migrate_default_capacity:
+            self.observe_transition(event)
+
+    def capacity_counts(self):
+        return {
+            "capacity": self.state["capacity"],
+            "queued": sum(r["state"] == "queued" for r in self.state["requests"].values()),
+            "active": sum(d["state"] != "deleted" for d in self.state["devices"].values()),
+        }
+
+    def observe(self, event, **fields):
+        if self.migrate_default_capacity:
+            observe(event, **self.capacity_counts(), **fields)
+
+    def observe_transition(self, event):
+        kind = event["event"]
+        if kind not in {"requested", "create-intent", "released", "cleanup-verified"}:
+            return
+        device = self.state["devices"].get(event.get("device_id"))
+        request_id = event.get("request_id") or (device and device["request_id"])
+        request = self.state["requests"].get(request_id)
+        if request is None:
+            return
+        managed = request.get("run_id")
+        run_id = managed or request_id
+        if kind == "create-intent":
+            wait_ms = max(0, round((self.clock() - request["created"]) * 1000))
+            self.observe("admit", run_id=run_id, wait_ms=wait_ms)
+        elif not managed and kind == "requested" and request["state"] == "queued":
+            self.observe("enqueue", run_id=run_id, reason="waiting-for-device")
+        elif not managed and kind == "released" and request["device_id"] is None:
+            self.observe("cancel", run_id=run_id)
+        elif not managed and kind == "cleanup-verified":
+            self.observe("finish", run_id=run_id, cleanup="verified")
 
     def request(self, token):
         if not isinstance(token, str) or len(token) > 200:
@@ -787,6 +823,10 @@ class Queue:
                 else {"mode": "internal"},
                 "attention": self.state.get("attention"),
             }
+            if sweep and self.migrate_default_capacity:
+                counts = self.capacity_counts()
+                if counts["active"] or counts["queued"]:
+                    observe("sample", **counts)
             if compact:
                 active = sorted(
                     (

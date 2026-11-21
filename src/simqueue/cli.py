@@ -83,6 +83,7 @@ def main():
                 "xcode-test",
                 "run-xctest",
                 "xctest-status",
+                "xctest-wait",
             }
             if args.tool not in allowed:
                 parser.error("Unknown tool")
@@ -98,6 +99,8 @@ def main():
                 result = runs.submit(**values)
             elif args.tool == "xctest-status":
                 result = runs.status(**values)
+            elif args.tool == "xctest-wait":
+                result = runs.wait(**values)
             else:
                 result = getattr(q, args.tool)(**values)
         print(json.dumps(result, indent=2))

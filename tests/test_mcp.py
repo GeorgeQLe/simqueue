@@ -29,6 +29,7 @@ def test_sdk_protocol(tmp_path, mode):
                 "install",
                 "run_xctest",
                 "xctest_status",
+                "xctest_wait",
             }
             invalid = await client.call_tool("release", {"lease_token": "invalid"})
             assert invalid.is_error

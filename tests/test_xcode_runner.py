@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import textwrap
 import time
@@ -12,7 +13,21 @@ from unittest.mock import Mock
 import pytest
 from mcp import Client, StdioServerParameters
 
-from simqueue.cli import xcode_test
+from simqueue.xctest import XCTestRuns, xcode_test
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"phase": "submitted", "attention": "Worker has not started"},
+        {"phase": "interrupted", "cleanup": "pending"},
+        {"phase": "finished", "outcome": "passed", "cleanup": "pending"},
+    ],
+)
+def test_wait_surfaces_attention_without_claiming_cleanup(tmp_path, status):
+    runs = XCTestRuns(Mock(root=tmp_path))
+    runs.status = Mock(return_value=status)
+    assert runs.wait("run") == {"wait_result": "attention", **status}
 
 
 def test_xcode_runner_targets_only_the_lease(tmp_path, monkeypatch):
@@ -81,6 +96,12 @@ def simulated_host(tmp_path, monkeypatch):
     checker = tools / "developer-host"
     checker.write_text(
         f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "if sys.argv[1] == 'queue-metrics':\n"
+        "    with (Path.home() / 'metrics.jsonl').open('a') as stream:\n"
+        "        stream.write(sys.stdin.read() + '\\n')\n"
+        "    sys.exit(0)\n"
         "print("
         + repr(
             json.dumps(
@@ -215,6 +236,8 @@ def fake_server(commands):
 
 def test_managed_run_survives_mcp_disconnect(simulated_host):
     home, options, commands = simulated_host
+    # Use the normal queue entry point in the isolated fake home to exercise telemetry.
+    commands = commands[:2]
     runner = fake_server(commands)
 
     async def run():
@@ -231,10 +254,19 @@ def test_managed_run_survives_mcp_disconnect(simulated_host):
                 assert repeated["phase"] == "testing"
                 active = await result_of(client, "status", {})
                 assert [r["run_id"] for r in active["requests"]] == [submitted["run_id"]]
-                (home / "finish-xcode").touch()
-                result = await wait_for_run(
-                    client, submitted["run_id"], lambda s: s["phase"] == "finished"
+                wait_args = {"run_id": submitted["run_id"], "timeout_seconds": 1}
+                assert await result_of(client, "xctest_wait", wait_args) == {
+                    "wait_result": "timeout",
+                    "run_id": submitted["run_id"],
+                    "phase": "testing",
+                }
+                waiter = asyncio.create_task(
+                    result_of(client, "xctest_wait", {**wait_args, "timeout_seconds": 10})
                 )
+                assert (await result_of(client, "status", {}))["requests"]
+                (home / "finish-xcode").touch()
+                result = await waiter
+                assert result["wait_result"] == "finished"
                 assert result["outcome"] == "passed" and result["xcode_exit_code"] == 0
                 assert Path(result["result_bundle"]).is_dir()
                 assert Path(result["log_path"]).read_text() == "fake XCTest passed\n"
@@ -247,6 +279,33 @@ def test_managed_run_survives_mcp_disconnect(simulated_host):
     asyncio.run(run())
     assert json.loads((home / "inventory.json").read_text()) == {}
     assert not any((home / "Library/Developer/CoreSimulator/Devices").iterdir())
+
+    cli = subprocess.run(
+        [sys.executable, *commands, "call", "xctest-wait"],
+        input=json.dumps({"run_id": options["run_id"], "timeout_seconds": 900}),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert json.loads(cli.stdout)["cleanup"] == "verified"
+
+    metrics = home / "metrics.jsonl"
+    deadline = time.monotonic() + 3
+    rows = []
+    while time.monotonic() < deadline:
+        if metrics.exists():
+            rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+            if len(rows) >= 3:
+                break
+        time.sleep(0.03)
+    by_event = {row["event"]: row for row in rows}
+    assert set(by_event) == {"enqueue", "admit", "finish"}
+    assert all(row["run_id"] == options["run_id"] for row in rows)
+    assert by_event["admit"]["active"] == 1
+    assert by_event["finish"]["active"] == 0
+    assert by_event["finish"]["outcome"] == "passed"
+    assert by_event["finish"]["cleanup"] == "verified"
+    assert not any("lease_token" in row or "arguments" in row for row in rows)
 
 
 def test_managed_run_identifies_boot_stall_and_cleans_up(simulated_host):

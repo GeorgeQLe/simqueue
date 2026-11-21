@@ -55,12 +55,38 @@ remaining limits. The separate fresh-device Contacts workaround is described bel
 Use iOS 26.5 when reliable app testing matters more than investigating this iOS 27
 beta runtime. No automatic service restart or shared-runtime replacement is used.
 
+## Resource observations
+
+The default queue sends enqueue, device reservation, and terminal events to
+`developer-host queue-metrics`. Managed XCTest samples about every 30 seconds
+from its own detached worker, including time spent queued. The existing
+minute-based sweeper can provide additional samples for manual leases.
+There is no extra model call or dependency for a test to proceed. Counters and
+the shared rolling log format are documented under **Queue resource observations**
+in the developer-host README.
+
 ## Agent workflow
 
 For a built XCTest plan, submit `run_xctest` once. Simqueue queues, renews, boots,
-runs stable Xcode on its own leased simulator, and verifies cleanup. Use
-`xctest_status` with the returned run ID to follow progress or reconnect from
-another client. Closing the submitting CLI or MCP connection leaves the worker
+runs stable Xcode on its own leased simulator, and verifies cleanup. Wait with
+`xctest_wait` and the returned run ID. It returns the outcome and cleanup or a
+state requiring attention. Its 45-second maximum lets it return before a typical
+MCP deadline. For multi-minute runs, prefer one local CLI wait (up to 900 seconds)
+with a host timeout that covers the wait:
+
+```sh
+simqueue call xctest-wait <<'JSON'
+{"run_id":"<the returned run ID>","timeout_seconds":900}
+JSON
+```
+
+`wait_result: finished` means the run ended and cleanup is verified or it never
+created a device. Check `outcome` separately for the test result.
+`wait_result: attention` means recovery may be needed. A timeout returns the
+current phase and the same run ID. The wait is read-only, so it is safe to wait
+again on that ID. Use `xctest_status` for intermediate diagnostics. A host that
+supports deferred responses can deliver the wait result when it is ready.
+Closing the submitting CLI or MCP connection leaves the worker
 running. For safe resubmission after a lost reply, supply a client-generated
 32-character lowercase hexadecimal `run_id` and reuse it with the same arguments.
 Choose a new run ID and result path for a new test attempt.

@@ -1,13 +1,15 @@
 """Typed stdio MCP surface; no arbitrary commands or adoption of existing devices."""
 
-from typing import Any
+from typing import Annotated, Any
 
+from anyio import to_thread
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
 
 from .backend import Attention
 from .core import ROUTINE_RUNTIME
-from .xctest import XCTestRuns
+from .xctest import MCP_WAIT_SECONDS, XCTestRuns
 
 
 def invoke(operation, *args, **kwargs):
@@ -23,7 +25,8 @@ def make_server(queue):
         "simqueue",
         version="0.2.2",
         instructions=(
-            "For built XCTest plans, submit run_xctest and keep its run ID for xctest_status. "
+            "For built XCTest plans, submit run_xctest and use xctest_wait with its run ID. "
+            "For multi-minute waits, use the local CLI xctest-wait for one longer wait. "
             "The worker manages queueing, boot, test execution and cleanup even after the client disconnects. "
             "Use iOS 26.5 for routine testing when available. For manual operations, acquire one isolated simulator lease and poll/heartbeat queued requests. "
             "Use its returned device_set with simctl --set and only its returned UUID. Share only by explicit sharing capability. "
@@ -124,6 +127,17 @@ def make_server(queue):
     def xctest_status(run_id: str) -> dict[str, Any]:
         """Read progress, last native boot phase, test outcome and cleanup for one run."""
         return invoke(runs.status, run_id)
+
+    @server.tool(structured_output=True)
+    async def xctest_wait(
+        run_id: str,
+        timeout_seconds: Annotated[int, Field(ge=1, le=MCP_WAIT_SECONDS)] = MCP_WAIT_SECONDS,
+    ) -> dict[str, Any]:
+        """Wait in the tool for one managed run's outcome and cleanup or attention.
+        A timeout returns only the run ID and phase. The detached worker keeps running.
+        Use xctest_status only when intermediate progress or diagnostics are needed.
+        """
+        return await to_thread.run_sync(invoke, runs.wait, run_id, timeout_seconds)
 
     @server.tool(structured_output=True)
     def status(history: bool = False) -> dict[str, Any]:
