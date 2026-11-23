@@ -295,11 +295,14 @@ def test_managed_run_survives_mcp_disconnect(simulated_host):
     while time.monotonic() < deadline:
         if metrics.exists():
             rows = [json.loads(line) for line in metrics.read_text().splitlines()]
-            if len(rows) >= 3:
+            if any(row["event"] == "finish" for row in rows):
                 break
         time.sleep(0.03)
     by_event = {row["event"]: row for row in rows}
-    assert set(by_event) == {"enqueue", "admit", "finish"}
+    assert set(by_event) - {"sample"} == {"enqueue", "admit", "phase", "finish"}
+    phases = [row for row in rows if row["event"] == "phase"]
+    assert [row["phase"] for row in phases] == ["booting", "testing"]
+    assert phases[0]["run_ms"] <= phases[1]["run_ms"] <= by_event["finish"]["run_ms"]
     assert all(row["run_id"] == options["run_id"] for row in rows)
     assert by_event["admit"]["active"] == 1
     assert by_event["finish"]["active"] == 0

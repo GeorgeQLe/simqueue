@@ -65,6 +65,30 @@ There is no extra model call or dependency for a test to proceed. Counters and
 the shared rolling log format are documented under **Queue resource observations**
 in the developer-host README.
 
+Managed XCTest also records `phase` rows (`booting`, `testing`) whose `run_ms`
+is the time since submission, and its `finish` row carries `failed_phase` and
+the error class as `reason` when the run stopped before testing.
+
+## Shared host slot for cold boots
+
+On the default queue, a cold boot (device `Shutdown` or `Booting`) first takes
+the developer-host heavy-phase slot it shares with FormSeed3D Blender renders
+(**Shared heavy-phase slot** in the developer-host README). The wait happens
+after the lease and device are ready and outside the native boot budget, so it
+never counts toward the boot timeout. The boot and its same-device recheck run
+inside the slot, which is released when the device is ready or the attempt
+ends. An already `Booted` device, install, capture and XCTest itself never take
+the slot. Managed XCTest status shows the wait under `boot.initial.host_slot`
+(`waiting` with `reason`, then `acquired` with `wait_ms`). If the slot stays
+busy past `SIMQUEUE_HOST_SLOT_MAX_WAIT_SECONDS` (default 900) the boot is
+refused with `HostSlotBusy` before any native command runs; the device is not
+marked failed and can be booted again. A missing or failing helper lets the
+boot proceed without the slot. `SIMQUEUE_HOST_SLOT=off` disables it; custom
+state directories and fixtures do not use it. An absolute
+`DEVELOPER_HOST_LAUNCHER` selects a trial developer-host release instead of
+`~/.local/bin/developer-host`; a missing one disables the slot rather than
+falling back.
+
 ## Agent workflow
 
 For a built XCTest plan, submit `run_xctest` once. Simqueue queues, renews, boots,

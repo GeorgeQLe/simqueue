@@ -308,6 +308,21 @@ class XCTestRuns:
             if attempt != boot["attempt"] or snapshot != boot.get(attempt):
                 update(boot={**boot, "attempt": attempt, attempt: snapshot})
 
+        def mark(phase):
+            # Submission-to-phase timing for queue telemetry (best effort).
+            if not self.queue.migrate_default_capacity:
+                return
+            try:
+                with self.queue.locked(read_only=True):
+                    self.queue.observe(
+                        "phase",
+                        run_id=run_id,
+                        phase=phase,
+                        run_ms=max(0, round((time.time() - record["submitted_at"]) * 1000)),
+                    )
+            except (Attention, OSError):
+                pass
+
         cleanup = "no_device"
         try:
             arguments = record["request"]["arguments"]
@@ -342,6 +357,7 @@ class XCTestRuns:
                 device_uuid=lease["uuid"],
                 boot={"attempt": "initial"},
             )
+            mark("booting")
             if not self.queue.boot(token, progress=boot_progress)["boot_ready"]:
                 raise Attention("The leased simulator did not reach verified readiness")
 
@@ -350,6 +366,7 @@ class XCTestRuns:
             log_path = result_path.with_name(f"simqueue-{run_id}.log")
             with log_path.open("xb") as log:
                 update(phase="testing", log_path=str(log_path))
+                mark("testing")
                 command = [
                     sys.executable,
                     "-c",
@@ -386,6 +403,7 @@ class XCTestRuns:
                 outcome="xcode_error" if phase == "testing" else "not_run",
                 failed_phase=phase,
                 error=str(exc),
+                error_kind=type(exc).__name__,
                 **(
                     {
                         "native_log_directory": str(
@@ -428,6 +446,14 @@ class XCTestRuns:
                             outcome=record["outcome"],
                             cleanup=cleanup,
                             run_ms=max(0, round((finished - record["submitted_at"]) * 1000)),
+                            **{
+                                key: record[field]
+                                for key, field in (
+                                    ("failed_phase", "failed_phase"),
+                                    ("reason", "error_kind"),
+                                )
+                                if field in record
+                            },
                         )
                 except (Attention, OSError):
                     pass

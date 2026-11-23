@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 
 from .backend import Attention, BootFailure, NativeTimeout, Processes
+from .host_slot import HostSlot, null_slot
 from .resource_log import observe
 
 ROUTINE_RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-26-5"
@@ -46,6 +47,7 @@ class Queue:
         clock=time.time,
         max_devices=2,
         migrate_default_capacity=False,
+        host_slot=None,
     ):
         self.root = Path(root).absolute()
         self.backend = backend
@@ -55,6 +57,11 @@ class Queue:
             raise ValueError("Capacity must be 1..8")
         self.capacity = max_devices
         self.migrate_default_capacity = migrate_default_capacity
+        # The shared developer-host cold-boot/render slot guards the default
+        # installed queue only; fixtures and custom state directories opt in.
+        if host_slot is None:
+            host_slot = HostSlot() if migrate_default_capacity else null_slot
+        self.host_slot = host_slot
         self.state = None
 
     @contextlib.contextmanager
@@ -747,41 +754,65 @@ class Queue:
     def boot(self, token, progress=None):
         observe = self.backend.observe_boot(progress) if progress else contextlib.nullcontext()
         with self.device_operation(token, "boot") as (device, request_id), observe:
+            # Decide whether this is a cold boot before taking the shared host
+            # slot. The slot wait runs outside every native budget, so it never
+            # counts toward the boot timeout; the boot and its same-device
+            # recheck then run inside the slot, which is released when the
+            # simulator is ready or the attempt ends.
             try:
-                with self.backend.operation_budget():
-                    actual = self.checked_device(device, self.backend.devices())
-                    if actual is None:
-                        raise Attention("Managed device is missing")
-                    if actual["state"] == "Shutdown":
-                        self.backend.boot(device["uuid"])
-                    elif actual["state"] in ("Booting", "Booted"):
-                        self.backend.wait_ready(device["uuid"])
-                    else:
-                        raise Attention(
-                            "Managed device is transitioning; native readiness unverified"
-                        )
-            except NativeTimeout as initial:
-                if progress:
-                    progress({"attempt": "recheck"})
-                try:
-                    with self.backend.operation_budget(seconds=30):
-                        actual = self.checked_device(device, self.backend.devices())
-                        if actual is None or actual["state"] not in (
-                            "Booted",
-                            "Booting",
-                        ):
-                            raise Attention("Managed device is not booting or booted")
-                        self.backend.wait_ready(device["uuid"])
-                except BootFailure:
-                    raise
-                except Attention as exc:
-                    raise BootReadinessUncertain(
-                        f"Boot readiness remains uncertain after one recheck. Initial wait: {initial}. "
-                        f"Recheck: {exc}. Inspect CoreSimulator logs for this UUID and release the lease."
-                    ) from exc
+                with self.backend.operation_budget(seconds=30):
+                    current = self.checked_device(device, self.backend.devices())
+            except NativeTimeout:
+                current = None  # inventory stalled: assume a cold boot follows
+            else:
+                if current is None:
+                    raise Attention("Managed device is missing")
+            cold = current is None or current["state"] in ("Shutdown", "Booting")
+            if cold:
+                with self.locked(read_only=True):
+                    request = self.state["requests"][request_id]
+                    run_id = request.get("run_id") or request_id
+                slot = self.host_slot(run_id, progress)
+            else:
+                slot = contextlib.nullcontext()
+            with slot:
+                self.boot_attempt(device, progress)
         with self.locked():
             request = self.state["requests"][request_id]
             return {**self.public(request), "boot_ready": request["state"] == "granted"}
+
+    def boot_attempt(self, device, progress):
+        """One boot under the native budget plus at most one same-device recheck."""
+        try:
+            with self.backend.operation_budget():
+                actual = self.checked_device(device, self.backend.devices())
+                if actual is None:
+                    raise Attention("Managed device is missing")
+                if actual["state"] == "Shutdown":
+                    self.backend.boot(device["uuid"])
+                elif actual["state"] in ("Booting", "Booted"):
+                    self.backend.wait_ready(device["uuid"])
+                else:
+                    raise Attention("Managed device is transitioning; native readiness unverified")
+        except NativeTimeout as initial:
+            if progress:
+                progress({"attempt": "recheck"})
+            try:
+                with self.backend.operation_budget(seconds=30):
+                    actual = self.checked_device(device, self.backend.devices())
+                    if actual is None or actual["state"] not in (
+                        "Booted",
+                        "Booting",
+                    ):
+                        raise Attention("Managed device is not booting or booted")
+                    self.backend.wait_ready(device["uuid"])
+            except BootFailure:
+                raise
+            except Attention as exc:
+                raise BootReadinessUncertain(
+                    f"Boot readiness remains uncertain after one recheck. Initial wait: {initial}. "
+                    f"Recheck: {exc}. Inspect CoreSimulator logs for this UUID and release the lease."
+                ) from exc
 
     def booted_operation(self, token, kind, argument):
         with (
