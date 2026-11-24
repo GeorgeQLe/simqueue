@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import json
 import os
+import plistlib
 import re
 import selectors
 import subprocess
@@ -54,6 +55,52 @@ def boot_detail(output):
     return detail
 
 
+CORESIMULATOR_INFO = Path(
+    "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/Resources/Info.plist"
+)
+EXPECTED_CORESIMULATOR = re.compile(r'^EXPECTED_VERSION="([0-9][0-9.]*)"$', re.MULTILINE)
+
+
+def _version(text):
+    parts = [int(part) for part in text.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def first_launch_pending(simctl_launcher, info_plist=CORESIMULATOR_INFO):
+    """Return (installed, expected) CoreSimulator versions when the selected
+    Xcode's simctl launcher would start its password-gated first-launch install,
+    which blocks every noninteractive simctl call. None when it would not."""
+    try:
+        match = EXPECTED_CORESIMULATOR.search(Path(simctl_launcher).read_text(errors="replace"))
+    except (OSError, ValueError):
+        return None
+    if not match:
+        return None
+    expected = match[1]
+    try:
+        with open(info_plist, "rb") as handle:
+            installed = str(plistlib.load(handle).get("CFBundleVersion") or "")
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        installed = ""
+    try:
+        if installed and _version(installed) >= _version(expected):
+            return None
+    except ValueError:
+        return None
+    return installed or "missing", expected
+
+
+def wrapper_developer_dir(wrapper):
+    """The DEVELOPER_DIR the shared apple-tools wrapper exports, if any."""
+    try:
+        match = re.search(r"^export DEVELOPER_DIR=(/\S+)$", Path(wrapper).read_text(), re.MULTILINE)
+    except OSError:
+        return None
+    return Path(match[1]) if match else None
+
+
 class AppleBackend:
     operation_timeout = 120
 
@@ -65,6 +112,35 @@ class AppleBackend:
             [str(self.wrapper), "xcrun"] if self.wrapper.exists() else ["/usr/bin/xcrun"]
         )
         self.device_root = Path.home() / "Library/Developer/CoreSimulator/Devices"
+        developer_dir = (
+            wrapper_developer_dir(self.wrapper)
+            if self.wrapper.exists()
+            else Path(os.environ["DEVELOPER_DIR"])
+            if os.environ.get("DEVELOPER_DIR")
+            else None
+        )
+        self.simctl_launcher = developer_dir / "usr/bin/simctl" if developer_dir else None
+        self.coresimulator_info = CORESIMULATOR_INFO
+
+    def check_toolchain(self):
+        """Refuse to start simctl while Xcode's first-launch install is pending.
+
+        After an Xcode update the selected simctl launcher runs
+        `xcodebuild -runFirstLaunch`, which waits on an administrator password
+        dialog, so every call would hang until its timeout and leave another
+        waiting installer behind."""
+        if not self.simctl_launcher:
+            return
+        pending = first_launch_pending(self.simctl_launcher, self.coresimulator_info)
+        if pending:
+            installed, expected = pending
+            developer_dir = self.simctl_launcher.parents[2]
+            raise Attention(
+                f"Xcode at {developer_dir.parent.parent} needs its first-launch install: "
+                f"CoreSimulator {installed} is older than the {expected} it expects. "
+                f"An administrator must run: sudo {developer_dir}/usr/bin/xcodebuild "
+                "-runFirstLaunch. simqueue does not start the password-gated install itself."
+            )
 
     @contextlib.contextmanager
     def operation_budget(self, seconds=None):
@@ -123,6 +199,7 @@ class AppleBackend:
             if remaining <= 0:
                 raise NativeTimeout("Native operation budget exhausted; outcome uncertain")
             timeout = min(timeout, remaining)
+        self.check_toolchain()
         env = dict(os.environ)
         env.pop("SIMULATOR_DEVICE_SET_PATH", None)
         command = [*self.tool_command, "simctl", "--set", str(self.device_root), *args]
